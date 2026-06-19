@@ -177,7 +177,7 @@ impl File {
     /// Backdating at this level never triggered in practice anyway: `AstPtr`
     /// ranges inside `Definition`s typically shift on edits.
     #[salsa::tracked(returns(ref), no_eq, cycle_result = semantic_index_cycle_result)]
-    pub(crate) fn semantic_index(self, db: &dyn Db) -> SemanticIndex {
+    pub fn semantic_index(self, db: &dyn Db) -> SemanticIndex {
         build_semantic_index(self, db)
     }
 
