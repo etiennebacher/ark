@@ -210,6 +210,46 @@ fn read_workspace_package(package_dir: &Path) -> Option<PackageEntry> {
     Some(package)
 }
 
+/// Walk `directory`, collecting `.R` files
+///
+/// `.R` files are split into either `files` or `scripts` based on `collation`,
+/// matching [read_workspace_package()].
+///
+/// The `directory` is not walked recursively. We expect that this is a flat directory of
+/// `.R` files.
+pub(crate) fn read_package_sources(
+    directory: &Path,
+    collation: Option<&[String]>,
+) -> (Vec<FileEntry>, Vec<FileEntry>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        log::warn!("Cannot read sources directory: {}", directory.display());
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut files: Vec<(PathBuf, FileEntry)> = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_r_file(&path) {
+            continue;
+        }
+        let Some(file_path) = FilePath::from_path_buf(path.clone()) else {
+            log::warn!("Skipping R file, can't build a URL: {}", path.display());
+            continue;
+        };
+        let revision = file_revision(&path);
+        files.push((path, FileEntry {
+            path: file_path,
+            revision,
+        }));
+    }
+
+    match collation {
+        Some(order) => order_by_collation(files, order),
+        None => order_alphabetically(files),
+    }
+}
+
 /// Split the package's `R/*.R` files into `(loadable, leftover)` using the
 /// `Collate:` directive: `loadable` is the listed files in that order, and
 /// `leftover` is the R/ files not listed. Logs mismatches in either direction:
@@ -245,7 +285,7 @@ fn order_by_collation(
     // it into the namespace, so it can't go in `files`; keep it as a standalone
     // script instead of dropping it. Sorted for a deterministic order.
     let mut leftover: Vec<(PathBuf, FileEntry)> = by_name.into_values().collect();
-    leftover.sort_by_key(|(path, _)| basename_key(path));
+    leftover.sort_by_cached_key(|(path, _)| basename_key(path));
     for (path, _) in &leftover {
         log::warn!(
             "R file `{}` is not listed in `Collate:`; treating it as a standalone \
@@ -263,7 +303,7 @@ fn order_by_collation(
 /// All files are loadable, in case-insensitive alphabetical order by basename.
 /// No leftover: without `Collate:`, R loads every R/ file.
 fn order_alphabetically(mut files: Vec<(PathBuf, FileEntry)>) -> (Vec<FileEntry>, Vec<FileEntry>) {
-    files.sort_by_key(|(path, _)| basename_key(path));
+    files.sort_by_cached_key(|(path, _)| basename_key(path));
     (
         files.into_iter().map(|(_, file)| file).collect(),
         Vec::new(),
