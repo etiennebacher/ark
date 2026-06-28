@@ -119,7 +119,7 @@ impl File {
     /// memory cleanly. Derived queries (e.g. `semantic_index`) store
     /// `AstPtr`s rather than tree nodes, so they don't pin an evicted tree.
     #[salsa::tracked(returns(ref), lru = 128)]
-    pub(crate) fn parse(self, db: &dyn Db) -> OakParse {
+    pub fn parse(self, db: &dyn Db) -> OakParse {
         OakParse::new(aether_parser::parse(
             self.source_text(db).as_str(),
             aether_parser::RParserOptions::default(),
