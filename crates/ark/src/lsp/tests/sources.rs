@@ -2,7 +2,7 @@
 //! event loop.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -10,106 +10,22 @@ use oak_db::Db;
 use oak_db::OakDatabase;
 use oak_scan::DbScan;
 use oak_semantic::library::Library;
-use tower_lsp::lsp_types::DidChangeWorkspaceFoldersParams;
-use tower_lsp::lsp_types::DidOpenTextDocumentParams;
-use tower_lsp::lsp_types::TextDocumentItem;
-use tower_lsp::lsp_types::WorkspaceFolder;
-use tower_lsp::lsp_types::WorkspaceFoldersChangeEvent;
-use url::Url;
 
+use super::source_handler::TestBehavior;
+use super::source_handler::TestSourceHandler;
+use super::utils::did_change_workspace_folders;
+use super::utils::did_open;
 use super::utils::test_client;
-use super::utils::write_description;
 use super::utils::write_sources;
-use crate::lsp::backend::LspMessage;
-use crate::lsp::backend::LspNotification;
+use super::utils::DescriptionWriter;
 use crate::lsp::main_loop::init_aux_for_test;
-use crate::lsp::main_loop::Event;
 use crate::lsp::main_loop::GlobalState;
 use crate::lsp::main_loop::LspState;
+use crate::lsp::sources::OakSourceHandler;
 use crate::lsp::sources::SourceHandler;
 use crate::lsp::sources::SourceRequest;
-use crate::lsp::sources::SourceResponse;
 use crate::lsp::sources::SourceScheduler;
 use crate::lsp::state::WorldState;
-
-/// A test [`SourceHandler`] that serves canned behavior per package name and records
-/// every call, so tests can count the number of calls. The handler is shared (as the
-/// `Arc<dyn SourceHandler>` the `SourceScheduler` holds and the clone the test keeps), so
-/// `calls` is a plain `Mutex`.
-struct TestSourceHandler {
-    /// Owns the cache directory that `Success` writes per-package sources into.
-    sources: tempfile::TempDir,
-    /// Per-package canned behavior.
-    behavior: HashMap<String, TestBehavior>,
-    /// Each request passed to `handle`, in call order.
-    calls: Mutex<Vec<SourceRequest>>,
-}
-
-// Canned behavior to perform when a particular package is requested
-enum TestBehavior {
-    /// Write these `(basename, contents)` files into the package's source dir
-    /// and return `Success(dir)`.
-    Success(Vec<(&'static str, &'static str)>),
-    Failure,
-}
-
-impl TestSourceHandler {
-    fn new(behavior: HashMap<String, TestBehavior>) -> Self {
-        Self {
-            sources: tempfile::tempdir().unwrap(),
-            behavior,
-            calls: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// The requests passed to `handle`, in call order, for the test to assert on.
-    fn calls(&self) -> &Mutex<Vec<SourceRequest>> {
-        &self.calls
-    }
-}
-
-impl SourceHandler for TestSourceHandler {
-    fn handle(&self, request: &SourceRequest) -> SourceResponse {
-        self.calls.lock().unwrap().push(request.clone());
-
-        match self.behavior.get(request.name()) {
-            Some(TestBehavior::Success(files)) => {
-                let dir = self.sources.path().join(request.name());
-                write_sources(&dir, files);
-                SourceResponse::Success(dir)
-            },
-            Some(TestBehavior::Failure) => SourceResponse::Failure,
-            None => panic!("Unknown test package {}", request.name()),
-        }
-    }
-}
-
-fn did_change_workspace_folders(path: &Path) -> Event {
-    Event::Lsp(LspMessage::Notification(
-        LspNotification::DidChangeWorkspaceFolders(DidChangeWorkspaceFoldersParams {
-            event: WorkspaceFoldersChangeEvent {
-                added: vec![WorkspaceFolder {
-                    uri: Url::from_file_path(path).unwrap(),
-                    name: String::new(),
-                }],
-                removed: vec![],
-            },
-        }),
-    ))
-}
-
-fn did_open(path: &Path, contents: &str) -> Event {
-    Event::Lsp(LspMessage::Notification(
-        LspNotification::DidOpenTextDocument(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: Url::from_file_path(path).unwrap(),
-                language_id: String::from("r"),
-                version: 0,
-                text: contents.to_string(),
-            },
-        }),
-    ))
-}
 
 /// The package names passed to the handler, in call order.
 fn dispatched_names(calls: &Mutex<Vec<SourceRequest>>) -> Vec<String> {
@@ -119,6 +35,28 @@ fn dispatched_names(calls: &Mutex<Vec<SourceRequest>>) -> Vec<String> {
         .iter()
         .map(|request| request.name().to_string())
         .collect()
+}
+
+/// Find R on the `PATH`
+///
+/// On Windows, `which` (from Git) returns POSIX paths that `Command::new()` can't resolve.
+/// Use `where` which returns native paths.
+fn find_r() -> PathBuf {
+    let output = std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+        .arg("R")
+        .output()
+        .unwrap_or_else(|err| panic!("Failed to find R: {err}"));
+    assert!(output.status.success());
+
+    // `where` on Windows can return multiple matches, take the first
+    PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("Non-UTF8 R path")
+            .trim()
+            .lines()
+            .next()
+            .expect("R should exist"),
+    )
 }
 
 /// The happy path end to end: a workspace uses an installed library package via
@@ -135,7 +73,11 @@ async fn test_source_pipeline_ingests_package_sources() {
 
     // An installed library package with no `R/` sources of its own
     let lib = tempfile::tempdir().unwrap();
-    write_description(&lib.path().join("donor"), "donor");
+    DescriptionWriter::new()
+        .package("donor")
+        .version("0.0.0")
+        .built("dummy")
+        .write(&lib.path().join("donor"));
     let mut db = OakDatabase::new();
     db.set_library_paths(&[lib.path().to_path_buf()]);
 
@@ -151,7 +93,10 @@ async fn test_source_pipeline_ingests_package_sources() {
     // A workspace package that uses `donor` via `::`.
     let workspace = tempfile::tempdir().unwrap();
     let myproj = workspace.path().join("myproj");
-    write_description(&myproj, "myproj");
+    DescriptionWriter::new()
+        .package("myproj")
+        .version("0.0.0")
+        .write(&myproj);
     write_sources(&myproj.join("R"), &[("use.R", "donor::foo()\n")]);
 
     state
@@ -165,6 +110,7 @@ async fn test_source_pipeline_ingests_package_sources() {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].name(), "donor");
         assert_eq!(recorded[0].version(), "0.0.0");
+        assert_eq!(recorded[0].built(), "dummy");
         assert_eq!(recorded[0].library_path(), lib.path());
     }
 
@@ -188,7 +134,11 @@ async fn test_failed_source_is_not_retried() {
     )])));
 
     let lib = tempfile::tempdir().unwrap();
-    write_description(&lib.path().join("donor"), "donor");
+    DescriptionWriter::new()
+        .package("donor")
+        .version("0.0.0")
+        .built("dummy")
+        .write(&lib.path().join("donor"));
     let mut db = OakDatabase::new();
     db.set_library_paths(&[lib.path().to_path_buf()]);
 
@@ -203,7 +153,10 @@ async fn test_failed_source_is_not_retried() {
 
     let workspace = tempfile::tempdir().unwrap();
     let myproj = workspace.path().join("myproj");
-    write_description(&myproj, "myproj");
+    DescriptionWriter::new()
+        .package("myproj")
+        .version("0.0.0")
+        .write(&myproj);
     write_sources(&myproj.join("R"), &[("use.R", "donor::foo()\n")]);
 
     state
@@ -224,4 +177,75 @@ async fn test_failed_source_is_not_retried() {
     assert_eq!(dispatched_names(handler.calls()), vec![String::from(
         "donor"
     )]);
+}
+
+/// End to end against real `srcref` recovery: install {generics} from source into a
+/// temporary library, point a workspace at it via `::`, inject the real
+/// [`OakSourceHandler`], and assert the recovered sources are ingested.
+///
+/// Requires R on the `PATH` and internet access. We use {generics} because it is small and
+/// easy to install from source, the same package `oak_srcref`'s own extraction test uses.
+#[tokio::test]
+async fn test_source_pipeline_ingests_real_srcref_sources() {
+    let _aux = init_aux_for_test();
+
+    let r = find_r();
+
+    // Temporary library, with {generics} installed from source so srcrefs are preserved
+    let library = tempfile::tempdir().unwrap();
+
+    // Use forward slashes so the path is safe inside R string literals on Windows
+    let library_literal = library.path().display().to_string().replace('\\', "/");
+
+    let output = oak_r_process::run_text(
+        &r,
+        &format!(
+            r#"install.packages("generics", lib = "{library_literal}", repos = "https://cran.r-project.org", type = "source", INSTALL_opts = "--with-keep.source")"#,
+        ),
+        &[],
+        &[],
+    )
+    .expect("Failed to run install.packages()");
+    assert!(output.status.success());
+
+    // The real handler, with both caches rooted in a temp dir so the test doesn't touch
+    // the shared on disk cache
+    let cache = tempfile::tempdir().unwrap();
+    let handler: Arc<dyn SourceHandler> =
+        Arc::new(OakSourceHandler::new_in(cache.path(), r).unwrap());
+
+    let mut db = OakDatabase::new();
+    db.set_library_paths(&[library.path().to_path_buf()]);
+
+    let mut state = GlobalState::from_parts(
+        test_client(),
+        WorldState::new(db, Library::new(vec![])),
+        LspState::new(
+            tokio::sync::mpsc::unbounded_channel().0,
+            SourceScheduler::new(Some(handler)),
+        ),
+    );
+
+    // A workspace package that uses {generics} via `::`
+    let workspace = tempfile::tempdir().unwrap();
+    let myproj = workspace.path().join("myproj");
+    DescriptionWriter::new()
+        .package("myproj")
+        .version("0.0.0")
+        .write(&myproj);
+    write_sources(&myproj.join("R"), &[("use.R", "generics::as.factor()\n")]);
+
+    state
+        .handle_event_to_quiescence(did_change_workspace_folders(workspace.path()))
+        .await;
+
+    // {generics} now carries its recovered sources, readable from disk. {generics} is a
+    // package of S3 generics, so every recovered file is full of `UseMethod()` calls.
+    let db = &state.world().db;
+    let generics = db.package_by_name("generics").unwrap();
+    let files = generics.files(db).clone();
+    assert!(!files.is_empty());
+    assert!(files
+        .iter()
+        .any(|file| file.source_text(db).contains("UseMethod")));
 }
