@@ -26,18 +26,16 @@ impl RIdentifierExt for RIdentifier {
 
 pub trait RStringValueExt {
     /// Return the string contents without surrounding quotes.
-    ///
-    /// Works around `RStringValue::inner_string_text()` in `aether_syntax`
-    /// which checks for node kind `R_STRING_VALUE` instead of token kind
-    /// `R_STRING_LITERAL`, so it never actually strips the delimiters.
     fn string_text(&self) -> Option<String>;
 }
 
 impl RStringValueExt for RStringValue {
     fn string_text(&self) -> Option<String> {
-        let token = self.value_token().ok()?;
-        let text = token.text_trimmed();
-        Some(text[1..text.len() - 1].to_string())
+        // The content token is absent for empty strings like `""`.
+        match self.content_token() {
+            Some(token) => Some(token.text_trimmed().to_string()),
+            None => Some(String::new()),
+        }
     }
 }
 

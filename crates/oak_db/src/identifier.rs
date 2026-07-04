@@ -285,6 +285,9 @@ fn is_name_token(token: &RSyntaxToken) -> bool {
     // function call position.
     matches!(
         token.kind(),
-        RSyntaxKind::IDENT | RSyntaxKind::R_STRING_LITERAL
+        RSyntaxKind::IDENT |
+            RSyntaxKind::STRING_OPEN |
+            RSyntaxKind::STRING_CONTENT |
+            RSyntaxKind::STRING_CLOSE
     )
 }
