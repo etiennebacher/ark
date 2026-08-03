@@ -44,6 +44,7 @@ pub mod startup;
 pub mod strings;
 pub mod sys;
 pub mod thread;
+pub mod timeout;
 pub mod traps;
 pub mod treesitter;
 pub mod ui;
@@ -56,3 +57,4 @@ pub mod viewer;
 pub(crate) use r_task::r_task;
 
 pub const BUILD_VERSION: &str = env!("BUILD_VERSION");
+pub const BUILD_GIT_HASH: &str = env!("BUILD_GIT_HASH");

@@ -8,44 +8,44 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use aether_path::AbsPathBuf;
 use aether_path::FilePath;
 use anyhow::anyhow;
 use oak_scan::DbScan;
 use oak_scan::FileEvent;
 use oak_scan::FileEventKind;
-use oak_semantic::package::Package;
 use stdext::result::ResultExt;
-use tower_lsp::lsp_types;
-use tower_lsp::lsp_types::CompletionOptions;
-use tower_lsp::lsp_types::CompletionOptionsCompletionItem;
-use tower_lsp::lsp_types::DidChangeConfigurationParams;
-use tower_lsp::lsp_types::DidChangeTextDocumentParams;
-use tower_lsp::lsp_types::DidChangeWatchedFilesParams;
-use tower_lsp::lsp_types::DidChangeWorkspaceFoldersParams;
-use tower_lsp::lsp_types::DidCloseTextDocumentParams;
-use tower_lsp::lsp_types::DidOpenTextDocumentParams;
-use tower_lsp::lsp_types::DocumentOnTypeFormattingOptions;
-use tower_lsp::lsp_types::ExecuteCommandOptions;
-use tower_lsp::lsp_types::FileChangeType;
-use tower_lsp::lsp_types::FoldingRangeProviderCapability;
-use tower_lsp::lsp_types::FormattingOptions;
-use tower_lsp::lsp_types::HoverProviderCapability;
-use tower_lsp::lsp_types::ImplementationProviderCapability;
-use tower_lsp::lsp_types::InitializeParams;
-use tower_lsp::lsp_types::InitializeResult;
-use tower_lsp::lsp_types::OneOf;
-use tower_lsp::lsp_types::RenameOptions;
-use tower_lsp::lsp_types::SelectionRangeProviderCapability;
-use tower_lsp::lsp_types::ServerCapabilities;
-use tower_lsp::lsp_types::ServerInfo;
-use tower_lsp::lsp_types::SignatureHelpOptions;
-use tower_lsp::lsp_types::TextDocumentSyncCapability;
-use tower_lsp::lsp_types::TextDocumentSyncKind;
-use tower_lsp::lsp_types::WorkDoneProgressOptions;
-use tower_lsp::lsp_types::WorkspaceFoldersServerCapabilities;
-use tower_lsp::lsp_types::WorkspaceServerCapabilities;
+use tower_lsp_server::ls_types as lsp_types;
+use tower_lsp_server::ls_types::CompletionOptions;
+use tower_lsp_server::ls_types::CompletionOptionsCompletionItem;
+use tower_lsp_server::ls_types::DidChangeConfigurationParams;
+use tower_lsp_server::ls_types::DidChangeTextDocumentParams;
+use tower_lsp_server::ls_types::DidChangeWatchedFilesParams;
+use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
+use tower_lsp_server::ls_types::DidCloseTextDocumentParams;
+use tower_lsp_server::ls_types::DidOpenTextDocumentParams;
+use tower_lsp_server::ls_types::DocumentOnTypeFormattingOptions;
+use tower_lsp_server::ls_types::ExecuteCommandOptions;
+use tower_lsp_server::ls_types::FileChangeType;
+use tower_lsp_server::ls_types::FoldingRangeProviderCapability;
+use tower_lsp_server::ls_types::FormattingOptions;
+use tower_lsp_server::ls_types::HoverProviderCapability;
+use tower_lsp_server::ls_types::ImplementationProviderCapability;
+use tower_lsp_server::ls_types::InitializeParams;
+use tower_lsp_server::ls_types::InitializeResult;
+use tower_lsp_server::ls_types::OneOf;
+use tower_lsp_server::ls_types::RenameOptions;
+use tower_lsp_server::ls_types::SelectionRangeProviderCapability;
+use tower_lsp_server::ls_types::ServerCapabilities;
+use tower_lsp_server::ls_types::ServerInfo;
+use tower_lsp_server::ls_types::SignatureHelpOptions;
+use tower_lsp_server::ls_types::TextDocumentSyncCapability;
+use tower_lsp_server::ls_types::TextDocumentSyncKind;
+use tower_lsp_server::ls_types::Uri;
+use tower_lsp_server::ls_types::WorkDoneProgressOptions;
+use tower_lsp_server::ls_types::WorkspaceFoldersServerCapabilities;
+use tower_lsp_server::ls_types::WorkspaceServerCapabilities;
 use tracing::Instrument;
-use url::Url;
 
 use crate::console::ConsoleNotification;
 use crate::lsp;
@@ -55,15 +55,16 @@ use crate::lsp::config::indent_style_from_lsp;
 use crate::lsp::config::DOCUMENT_SETTINGS;
 use crate::lsp::config::GLOBAL_SETTINGS;
 use crate::lsp::content_changes::apply_content_changes;
-use crate::lsp::inputs::source_root::SourceRoot;
 use crate::lsp::main_loop::dispatch_scan_requests;
+use crate::lsp::main_loop::DiagnosticsPublication;
 use crate::lsp::main_loop::DidCloseVirtualDocumentParams;
 use crate::lsp::main_loop::DidOpenVirtualDocumentParams;
 use crate::lsp::main_loop::Event;
 use crate::lsp::main_loop::LspState;
 use crate::lsp::main_loop::TokioUnboundedSender;
-use crate::lsp::state::open_file_wire_urls;
+use crate::lsp::state::open_file_wire_uris;
 use crate::lsp::state::WorldState;
+use crate::lsp::traits::url::UriExt;
 
 // Handlers that mutate the world state
 
@@ -91,53 +92,19 @@ pub(crate) fn initialize(
     state: &mut WorldState,
     events_tx: &TokioUnboundedSender<Event>,
 ) -> LspResult<InitializeResult> {
-    let workspace_uris = effective_workspace_uris(&params);
+    let workspace_paths = effective_workspace_paths(&params);
     lsp_state.capabilities = Capabilities::new(params.capabilities);
 
-    // Initialize the workspace folders
-    let mut workspace_paths: Vec<PathBuf> = Vec::new();
-
-    for uri in workspace_uris {
-        state.workspace.folders.push(uri.clone());
-        if let Ok(path) = uri.to_file_path() {
-            workspace_paths.push(path.clone());
-            // Try to load package from this workspace folder and set as
-            // root if found. This means we're dealing with a package
-            // source.
-            if state.root.is_none() {
-                match Package::load_from_folder(&path) {
-                    Ok(Some(pkg)) => {
-                        log::info!(
-                            "Root: Loaded package `{pkg}` from {path} as project root",
-                            pkg = pkg.description().name,
-                            path = path.display()
-                        );
-                        state.root = Some(SourceRoot::Package(pkg));
-                    },
-                    Ok(None) => {
-                        log::info!(
-                            "Root: No package found at {path}, treating as folder of scripts",
-                            path = path.display()
-                        );
-                    },
-                    Err(err) => {
-                        log::warn!(
-                            "Root: Error loading package at {path}: {err}",
-                            path = path.display()
-                        );
-                    },
-                }
-            }
-        }
-    }
+    state.workspace.folders = workspace_paths;
 
     // Kick off the initial workspace scan
     let editor_owned: HashSet<FilePath> = state.open_files.keys().cloned().collect();
-    let requests =
-        lsp_state
-            .oak_scheduler
-            .set_workspace_paths(&mut state.db, &workspace_paths, &editor_owned);
-    dispatch_scan_requests(events_tx, requests);
+    let requests = lsp_state.oak_scheduler.set_workspace_paths(
+        &mut state.db,
+        &to_std_paths(&state.workspace.folders),
+        &editor_owned,
+    );
+    dispatch_scan_requests(&lsp_state.scan_pool, events_tx, requests);
 
     let result = InitializeResult {
         server_info: Some(ServerInfo {
@@ -204,6 +171,7 @@ pub(crate) fn initialize(
             }),
             ..ServerCapabilities::default()
         },
+        offset_encoding: None,
     };
 
     Ok(result)
@@ -213,12 +181,15 @@ pub(crate) fn initialize(
 ///
 /// We read only `workspaceFolders`, the modern field , without falling back to
 /// the deprecated `rootUri`. An empty or absent list means single-file mode.
-pub(super) fn effective_workspace_uris(params: &InitializeParams) -> Vec<Url> {
+/// A folder that isn't a `file:` URI, or whose path we can't make sense of, is
+/// silently dropped: it never backs a directory we could scan.
+pub(super) fn effective_workspace_paths(params: &InitializeParams) -> Vec<AbsPathBuf> {
     params
         .workspace_folders
         .iter()
         .flatten()
-        .map(|folder| folder.uri.clone())
+        .filter_map(|folder| folder.uri.to_url().log_err())
+        .filter_map(|url| AbsPathBuf::from_url(&url))
         .collect()
 }
 
@@ -228,11 +199,12 @@ pub(crate) fn did_open(
     state: &mut WorldState,
 ) -> anyhow::Result<()> {
     let contents = params.text_document.text;
-    let uri = params.text_document.uri;
+    let wire_uri = params.text_document.uri;
+    let path = wire_uri.to_document_path()?;
     let version = params.text_document.version;
 
-    let file = state.db.upsert_editor(FilePath::from_url(&uri), contents);
-    state.insert_open_file(uri.clone(), file, Some(version));
+    let file = state.db.upsert_editor(path.clone(), contents);
+    state.insert_open_file(wire_uri, path, file, Some(version));
 
     // NOTE: Do we need to call `update_config()` here?
     // update_config(vec![uri]).await;
@@ -246,12 +218,11 @@ pub(crate) fn did_change(
     lsp_state: &mut LspState,
     state: &mut WorldState,
 ) -> anyhow::Result<()> {
-    let uri = &params.text_document.uri;
-    let key = FilePath::from_url(uri);
+    let path = params.text_document.uri.to_document_path()?;
     let new_version = params.text_document.version;
     let encoding = state.config.position_encoding;
 
-    let file = state.open_file(uri)?;
+    let file = state.open_file(&path)?;
 
     // Reject out-of-order change notifications. The spec allows version numbers
     // to skip values but requires them to increase monotonically. A lower
@@ -272,14 +243,14 @@ pub(crate) fn did_change(
         &params.content_changes,
         encoding,
     );
-    state.db.upsert_editor(key.clone(), new_contents);
+    state.db.upsert_editor(path.clone(), new_contents);
 
-    state.open_file_mut(uri)?.set_version(Some(new_version));
+    state.open_file_mut(&path)?.set_version(Some(new_version));
 
     // Notify console about document change to invalidate breakpoints.
     lsp_state
         .console_notification_tx
-        .send(ConsoleNotification::DidChangeDocument(key))
+        .send(ConsoleNotification::DidChangeDocument(path))
         .log_err();
 
     Ok(())
@@ -290,20 +261,28 @@ pub(crate) fn did_close(
     params: DidCloseTextDocumentParams,
     state: &mut WorldState,
 ) -> anyhow::Result<()> {
-    let uri = params.text_document.uri;
+    let wire_uri = params.text_document.uri;
+    let path = wire_uri.to_document_path()?;
 
     // Publish empty set of diagnostics to clear them
-    lsp::publish_diagnostics(uri.clone(), Vec::new(), None);
+    lsp::publish_diagnostics(DiagnosticsPublication {
+        path: path.clone(),
+        uri: wire_uri.clone(),
+        diagnostics: Vec::new(),
+        version: None,
+    });
 
-    state
-        .open_files
-        .remove(&FilePath::from_url(&uri))
-        .ok_or(anyhow!("Failed to remove document for URI: {uri}"))?;
+    state.open_files.remove(&path).ok_or(anyhow!(
+        "Failed to remove document for URI: {}",
+        wire_uri.as_str()
+    ))?;
 
-    let path = FilePath::from_url(&uri);
     state.db.close_editor(&path);
 
-    lsp::log_info!("did_close(): closed document with URI: '{uri}'.");
+    lsp::log_info!(
+        "did_close(): closed document with URI: '{}'.",
+        wire_uri.as_str()
+    );
 
     Ok(())
 }
@@ -324,7 +303,7 @@ pub(crate) fn did_change_watched_files(
         .iter()
         .filter_map(|change| {
             Some(FileEvent {
-                path: FilePath::from_url(&change.uri),
+                path: change.uri.to_document_path().log_err()?,
                 kind: file_event_kind(change.typ)?,
             })
         })
@@ -334,7 +313,7 @@ pub(crate) fn did_change_watched_files(
         lsp_state
             .oak_scheduler
             .apply_watcher_events(&mut state.db, events, &editor_owned);
-    dispatch_scan_requests(events_tx, requests);
+    dispatch_scan_requests(&lsp_state.scan_pool, events_tx, requests);
 
     Ok(())
 }
@@ -355,38 +334,56 @@ pub(crate) fn did_change_workspace_folders(
     lsp_state: &mut LspState,
     events_tx: &TokioUnboundedSender<Event>,
 ) -> anyhow::Result<()> {
-    let removed: HashSet<Url> = params.event.removed.iter().map(|f| f.uri.clone()).collect();
-    state.workspace.folders.retain(|uri| !removed.contains(uri));
-
-    for folder in params.event.added {
-        if !state.workspace.folders.contains(&folder.uri) {
-            state.workspace.folders.push(folder.uri);
-        }
-    }
-
-    let workspace_paths: Vec<PathBuf> = state
+    let removed: HashSet<AbsPathBuf> = params
+        .event
+        .removed
+        .iter()
+        .filter_map(|f| f.uri.to_url().log_err())
+        .filter_map(|url| AbsPathBuf::from_url(&url))
+        .collect();
+    state
         .workspace
         .folders
-        .iter()
-        .filter_map(|uri| uri.to_file_path().ok())
-        .collect();
+        .retain(|path| !removed.contains(path));
+
+    for folder in params.event.added {
+        let Some(url) = folder.uri.to_url().log_err() else {
+            continue;
+        };
+        let Some(path) = AbsPathBuf::from_url(&url) else {
+            continue;
+        };
+        if !state.workspace.folders.contains(&path) {
+            state.workspace.folders.push(path);
+        }
+    }
 
     // Editor-owned URLs survive eviction in `OrphanRoot` so the user's
     // open buffers keep getting analysed even when their workspace
     // folder goes away.
     let editor_owned: HashSet<FilePath> = state.open_files.keys().cloned().collect();
 
-    let requests =
-        lsp_state
-            .oak_scheduler
-            .set_workspace_paths(&mut state.db, &workspace_paths, &editor_owned);
-    dispatch_scan_requests(events_tx, requests);
+    let requests = lsp_state.oak_scheduler.set_workspace_paths(
+        &mut state.db,
+        &to_std_paths(&state.workspace.folders),
+        &editor_owned,
+    );
+    dispatch_scan_requests(&lsp_state.scan_pool, events_tx, requests);
     Ok(())
+}
+
+/// Convert workspace folders to the `std::path::PathBuf`s the scan scheduler
+/// takes.
+fn to_std_paths(paths: &[AbsPathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .map(|path| path.as_path().as_std_path().to_path_buf())
+        .collect()
 }
 
 pub(crate) async fn did_change_configuration(
     _params: DidChangeConfigurationParams,
-    client: &tower_lsp::Client,
+    client: &tower_lsp_server::Client,
     state: &mut WorldState,
 ) -> anyhow::Result<()> {
     // The notification params sometimes contain data but it seems in practice
@@ -396,18 +393,18 @@ pub(crate) async fn did_change_configuration(
     // Note that the client sends notifications for settings for which we have
     // declared interest in. This registration is done in `handle_initialized()`.
 
-    update_config(open_file_wire_urls(state), client, state)
+    update_config(open_file_wire_uris(state), client, state)
         .instrument(tracing::info_span!("did_change_configuration"))
         .await
 }
 
 #[tracing::instrument(level = "info", skip_all)]
 pub(crate) fn did_change_formatting_options(
-    uri: &Url,
+    path: &FilePath,
     opts: &FormattingOptions,
     state: &mut WorldState,
 ) {
-    let Ok(doc) = state.open_file_mut(uri) else {
+    let Ok(doc) = state.open_file_mut(path) else {
         return;
     };
 
@@ -433,8 +430,8 @@ pub(crate) fn did_change_formatting_options(
 }
 
 async fn update_config(
-    uris: Vec<Url>,
-    client: &tower_lsp::Client,
+    open_files: Vec<(FilePath, Uri)>,
+    client: &tower_lsp_server::Client,
     state: &mut WorldState,
 ) -> anyhow::Result<()> {
     // Keep track of existing config to detect whether it was changed
@@ -455,12 +452,12 @@ async fn update_config(
 
     // For document items we create a n_uris * n_document_settings array that we'll
     // handle by batch in a double loop over URIs and document settings
-    let mut document_items: Vec<_> = uris
+    let mut document_items: Vec<_> = open_files
         .iter()
-        .flat_map(|uri| {
+        .flat_map(|(_path, uri)| {
             DOCUMENT_SETTINGS
                 .iter()
-                .map(|mapping| lsp_types::ConfigurationItem {
+                .map(move |mapping| lsp_types::ConfigurationItem {
                     scope_uri: Some(uri.clone()),
                     section: Some(mapping.key.to_string()),
                 })
@@ -493,23 +490,25 @@ async fn update_config(
 
     let mut remaining = document_configs;
 
-    for uri in uris.into_iter() {
+    for (path, _uri) in open_files {
         // Need to juggle a bit because `split_off()` returns the tail of the
         // split and updates the vector with the head
         let tail = remaining.split_off(DOCUMENT_SETTINGS.len());
         let head = std::mem::replace(&mut remaining, tail);
 
         for (mapping, value) in DOCUMENT_SETTINGS.iter().zip(head) {
-            if let Ok(doc) = state.open_file_mut(&uri) {
+            if let Ok(doc) = state.open_file_mut(&path) {
                 (mapping.set)(doc.config_mut(), value);
             }
         }
     }
 
-    // Refresh diagnostics if the configuration changed
+    // Refresh diagnostics if the configuration changed. The config lives
+    // outside Oak so we bump the revision manually, causing diagnostics
+    // to refresh on the next tick.
     if state.config.diagnostics != diagnostics_config {
-        tracing::info!("Refreshing diagnostics after configuration changed");
-        lsp::main_loop::diagnostics_refresh_all(state);
+        tracing::info!("Bumping salsa revision after configuration changed");
+        state.bump_revision();
     }
 
     Ok(())
@@ -526,8 +525,9 @@ pub(crate) fn did_change_console_inputs(
     // We currently rely on global console scopes for diagnostics, in particular
     // during package development in conjunction with `devtools::load_all()`.
     // Ideally diagnostics would not rely on these though, and we wouldn't need
-    // to refresh from here.
-    lsp::diagnostics_refresh_all(state);
+    // to refresh from here. The scopes live outside oak so we bump the revision
+    // manually, causing diagnostics to get refreshed on the next tick.
+    state.bump_revision();
 
     Ok(())
 }

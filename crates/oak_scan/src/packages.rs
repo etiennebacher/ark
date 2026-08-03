@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -34,9 +35,7 @@ pub(crate) struct PackageEntry {
     /// Mtime of `DESCRIPTION`, stat'd during the walk. Drives the lazy
     /// `Package::description()` query (and `version` / `collation` on top).
     pub description_revision: FileRevision,
-    /// Mtime of the package's `NAMESPACE`, stat'd during the walk. Drives
-    /// the lazy `Package::namespace()` query. That query is the only place
-    /// `NAMESPACE` gets read and parsed. The walk only stats it.
+    /// See [PackageEntry::description_revision]
     pub namespace_revision: FileRevision,
     /// `R/*.R` files: the package's loadable namespace.
     pub files: Vec<FileEntry>,
@@ -221,9 +220,18 @@ pub(crate) fn read_package_sources(
     directory: &Path,
     collation: Option<&[String]>,
 ) -> (Vec<FileEntry>, Vec<FileEntry>) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        log::warn!("Cannot read sources directory: {}", directory.display());
-        return (Vec::new(), Vec::new());
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        // A data-only package has no `R/`. `datasets` is always on the search
+        // path, so this is the common case, not an error.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return (Vec::new(), Vec::new()),
+        Err(err) => {
+            log::warn!(
+                "Cannot read sources directory {}: {err:?}",
+                directory.display()
+            );
+            return (Vec::new(), Vec::new());
+        },
     };
 
     let mut files: Vec<(PathBuf, FileEntry)> = Vec::new();

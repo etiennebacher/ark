@@ -1,11 +1,13 @@
 pub mod builder;
-pub mod library;
-pub mod package;
+pub mod effects;
 pub mod resolver;
 pub mod semantic_index;
 pub mod use_def_map;
 
 pub use builder::build_index;
+pub use effects::Effects;
+pub use effects::EffectsHandlers;
+pub use effects::ResolvedArgumentEffects;
 pub use resolver::ImportsResolver;
 pub use resolver::NoopImportsResolver;
 pub use resolver::SourceResolution;

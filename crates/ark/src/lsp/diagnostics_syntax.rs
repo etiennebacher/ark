@@ -5,7 +5,7 @@
 //
 //
 
-use tower_lsp::lsp_types::Diagnostic;
+use tower_lsp_server::ls_types::Diagnostic;
 use tree_sitter::Node;
 use tree_sitter::Range;
 
@@ -433,9 +433,8 @@ fn new_syntax_diagnostic(
 #[cfg(test)]
 mod tests {
     use aether_lsp_utils::proto::PositionEncoding;
-    use oak_semantic::library::Library;
-    use tower_lsp::lsp_types::Diagnostic;
-    use tower_lsp::lsp_types::Position;
+    use tower_lsp_server::ls_types::Diagnostic;
+    use tower_lsp_server::ls_types::Position;
 
     use crate::lsp::diagnostics::DiagnosticContext;
     use crate::lsp::diagnostics_syntax::syntax_diagnostics;
@@ -446,8 +445,7 @@ mod tests {
 
     fn text_diagnostics(text: &str) -> Vec<Diagnostic> {
         let (db, open_file) = test_open_file(text);
-        let library = Library::default();
-        let context = DiagnosticContext::new(&db, &None, &library, open_file.file(), ENCODING);
+        let context = DiagnosticContext::new(&db, open_file.file(), ENCODING, open_file.wire_uri());
         let diagnostics =
             syntax_diagnostics(open_file.tree_sitter(&db).root_node(), &context).unwrap();
         diagnostics

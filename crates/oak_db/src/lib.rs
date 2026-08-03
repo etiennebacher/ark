@@ -1,5 +1,6 @@
 mod db;
 mod definition;
+mod diagnostic;
 mod file;
 mod file_exports;
 mod file_imports;
@@ -12,17 +13,23 @@ mod name;
 mod package;
 mod package_resolve;
 mod parse;
+mod search;
 mod storage;
 mod workspace;
 
 #[cfg(test)]
 mod tests;
 
-pub use db::all_files;
+pub use db::all_known_files;
+pub use db::all_used_files;
 pub use db::workspace_files;
 pub use db::Db;
 pub use db::DbInputs;
 pub use definition::Definition;
+pub use diagnostic::Annotation;
+pub use diagnostic::Diagnostic;
+pub use diagnostic::DiagnosticKind;
+pub use diagnostic::Severity;
 pub use file::File;
 pub use file_exports::ExportEntry;
 pub use file_exports::FileExports;
@@ -30,7 +37,7 @@ pub use file_imports::ImportLayer;
 pub use file_revision::FileRevision;
 pub use identifier::Identifier;
 pub use identifier::MemberKind;
-pub use identifier::NamespacePart;
+pub use identifier::NamespaceVisibility;
 pub use inputs::LibraryRoots;
 pub use inputs::LiveRoot;
 pub use inputs::OrphanRoot;
@@ -41,6 +48,5 @@ pub use inputs::WorkspaceRoots;
 pub use name::Name;
 pub use oak_package_metadata::description::Priority;
 pub use package::Package;
-pub use package_resolve::PackageVisibility;
 pub use storage::OakDatabase;
-pub use workspace::workspace_dependencies;
+pub use workspace::all_package_dependencies;

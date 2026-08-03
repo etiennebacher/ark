@@ -5,6 +5,7 @@
 //
 //
 
+mod analysis;
 pub mod backend;
 pub mod capabilities;
 pub mod code_action;
@@ -28,7 +29,7 @@ pub mod hover;
 pub mod indent;
 pub mod indexer;
 pub mod input_boundaries;
-pub mod inputs;
+mod io_pool;
 pub mod main_loop;
 pub mod markdown;
 pub(crate) mod open_file;
@@ -44,6 +45,7 @@ pub mod statement_range;
 pub mod symbols;
 pub mod traits;
 pub mod util;
+mod watchdog;
 
 #[cfg(test)]
 mod tests;
@@ -51,13 +53,13 @@ mod tests;
 // These send LSP messages in a non-async and non-blocking way.
 // The LOG level is not timestamped so we're not using it.
 macro_rules! log_info {
-    ($($arg:tt)+) => ($crate::lsp::_log!(tower_lsp::lsp_types::MessageType::INFO, $($arg)+))
+    ($($arg:tt)+) => ($crate::lsp::_log!(tower_lsp_server::ls_types::MessageType::INFO, $($arg)+))
 }
 macro_rules! log_warn {
-    ($($arg:tt)+) => ($crate::lsp::_log!(tower_lsp::lsp_types::MessageType::WARNING, $($arg)+))
+    ($($arg:tt)+) => ($crate::lsp::_log!(tower_lsp_server::ls_types::MessageType::WARNING, $($arg)+))
 }
 macro_rules! log_error {
-    ($($arg:tt)+) => ($crate::lsp::_log!(tower_lsp::lsp_types::MessageType::ERROR, $($arg)+))
+    ($($arg:tt)+) => ($crate::lsp::_log!(tower_lsp_server::ls_types::MessageType::ERROR, $($arg)+))
 }
 macro_rules! _log {
     ($lvl:expr, $($arg:tt)+) => ({
@@ -69,6 +71,4 @@ pub(crate) use _log;
 pub(crate) use log_error;
 pub(crate) use log_info;
 pub(crate) use log_warn;
-pub(crate) use main_loop::diagnostics_refresh_all;
 pub(crate) use main_loop::publish_diagnostics;
-pub(crate) use main_loop::spawn_blocking;

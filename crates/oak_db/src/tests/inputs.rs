@@ -20,6 +20,7 @@ fn make_workspace_package(db: &mut OakDatabase, name: &str) -> (Root, Package) {
         FileRevision::zero(),
         FileRevision::zero(),
         None,
+        None,
         Vec::new(),
         Vec::new(),
     );
@@ -35,6 +36,7 @@ fn make_installed_package(db: &mut OakDatabase, name: &str) -> (Root, Package) {
         name.to_string(),
         FileRevision::zero(),
         FileRevision::zero(),
+        None,
         None,
         Vec::new(),
         Vec::new(),
@@ -87,7 +89,7 @@ fn test_root_scripts_round_trips_through_a_tracked_query() {
     // Exercises `Root.scripts: Vec<File>` as input to a tracked-query
     // return, confirming the salsa machinery picks up changes to the
     // scripts list and to which workspace root is registered.
-    #[salsa::tracked]
+    #[salsa::tracked(returns(copy))]
     fn first(db: &dyn Db) -> Option<File> {
         for root in db.workspace_roots().roots(db) {
             if let Some(&file) = root.scripts(db).first() {

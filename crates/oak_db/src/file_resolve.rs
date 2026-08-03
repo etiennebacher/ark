@@ -13,7 +13,7 @@ use crate::ExportEntry;
 use crate::File;
 use crate::ImportLayer;
 use crate::Name;
-use crate::PackageVisibility;
+use crate::NamespaceVisibility;
 
 #[salsa::tracked]
 impl<'db> File {
@@ -49,7 +49,7 @@ impl<'db> File {
     ///
     /// For the offset-aware, sequential-semantics variant, see
     /// [`File::resolve_at`].
-    #[salsa::tracked]
+    #[salsa::tracked(returns(clone))]
     pub fn resolve(self, db: &'db dyn Db, name: Name<'db>) -> Vec<Definition<'db>> {
         let exported = self.resolve_export(db, name);
         if !exported.is_empty() {
@@ -69,30 +69,9 @@ impl<'db> File {
         // `imports()` directly, as `From` / `Package` layers, so finding
         // them does not require walking through siblings.
         for layer in self.imports(db) {
-            match layer {
-                ImportLayer::File(target) => {
-                    let defs = target.resolve_export(db, name);
-                    if !defs.is_empty() {
-                        return defs;
-                    }
-                },
-                ImportLayer::Package(pkg) => {
-                    let defs = pkg.resolve(db, name, PackageVisibility::Exported);
-                    if !defs.is_empty() {
-                        return defs;
-                    }
-                },
-                ImportLayer::From(map) => {
-                    let name_str = name.text(db).as_str();
-                    if let Some(pkg_name) = map.get(name_str) {
-                        if let Some(pkg) = db.package_by_name(pkg_name) {
-                            let defs = pkg.resolve(db, name, PackageVisibility::Exported);
-                            if !defs.is_empty() {
-                                return defs;
-                            }
-                        }
-                    }
-                },
+            let defs = resolve_import_layer(db, layer, name);
+            if !defs.is_empty() {
+                return defs;
             }
         }
 
@@ -152,30 +131,9 @@ impl<'db> File {
         // chase, same as `resolve`'s imports walk). Avoids the sibling cycle and
         // matches R's namespace semantics.
         for layer in self.imports_at(db, offset) {
-            match layer {
-                ImportLayer::File(target) => {
-                    let defs = target.resolve_export(db, name);
-                    if !defs.is_empty() {
-                        return defs;
-                    }
-                },
-                ImportLayer::Package(pkg) => {
-                    let defs = pkg.resolve(db, name, PackageVisibility::Exported);
-                    if !defs.is_empty() {
-                        return defs;
-                    }
-                },
-                ImportLayer::From(map) => {
-                    let name_str = name.text(db).as_str();
-                    if let Some(pkg_name) = map.get(name_str) {
-                        if let Some(pkg) = db.package_by_name(pkg_name) {
-                            let defs = pkg.resolve(db, name, PackageVisibility::Exported);
-                            if !defs.is_empty() {
-                                return defs;
-                            }
-                        }
-                    }
-                },
+            let defs = resolve_import_layer(db, &layer, name);
+            if !defs.is_empty() {
+                return defs;
             }
         }
 
@@ -217,7 +175,7 @@ impl<'db> File {
     /// winner is still last.
     ///
     /// Cycles resolve to empty via `exports`'s `cycle_fn`.
-    #[salsa::tracked]
+    #[salsa::tracked(returns(clone))]
     pub(crate) fn resolve_export(self, db: &'db dyn Db, name: Name<'db>) -> Vec<Definition<'db>> {
         let mut results = Vec::new();
 
@@ -287,4 +245,38 @@ impl<'db> File {
             }
         }
     }
+}
+
+/// Resolve `name` against a single import layer, returning every definition it
+/// reaches there (empty means the layer doesn't bind it, so the caller falls
+/// through to the next layer). Shared by [`File::resolve`] and
+/// [`File::resolve_at`].
+///
+/// `File` siblings are chased through their exports only, not their full
+/// `resolve`: recursing would walk the sibling's own imports, which include
+/// *this* file, and salsa would cycle on any unbound name. Exports-only is also
+/// what R's namespace semantics asks for, a package's namespace is the merged
+/// exports of its collation files.
+fn resolve_import_layer<'db>(
+    db: &'db dyn Db,
+    layer: &ImportLayer,
+    name: Name<'db>,
+) -> Vec<Definition<'db>> {
+    // Reduce the layer to the package it binds `name` to, then resolve against
+    // that package's exports. A `File` sibling is the exception, resolved
+    // through its own exports chain.
+    let package = match layer {
+        ImportLayer::File(target) => return target.resolve_export(db, name),
+        ImportLayer::Package(package) => *package,
+        ImportLayer::From(importer) => {
+            match importer.imported_from(db).get(name.text(db).as_str()) {
+                Some(source) => match db.package_by_name(source) {
+                    Some(package) => package,
+                    None => return Vec::new(),
+                },
+                None => return Vec::new(),
+            }
+        },
+    };
+    package.resolve(db, name, NamespaceVisibility::Exported)
 }

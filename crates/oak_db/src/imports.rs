@@ -1,13 +1,21 @@
+use std::ops::ControlFlow;
+
 use aether_path::FilePath;
 use camino::Utf8Component;
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
+use oak_semantic::effects;
+use oak_semantic::EffectsHandlers;
 use oak_semantic::ImportsResolver;
 use oak_semantic::SourceResolution;
+use rustc_hash::FxHashMap;
 use url::Url;
 
+use crate::file_imports::CollationView;
+use crate::file_imports::ImportLayer;
 use crate::Db;
 use crate::File;
+use crate::Package;
 use crate::RootKind;
 
 /// Salsa-backed [`ImportsResolver`] consumed by the per-file semantic
@@ -19,9 +27,9 @@ use crate::RootKind;
 /// - `target.exports(db)` for the names `source()` injects into the
 ///   calling scope.
 ///
-/// - `target.attached_packages(db)` for the target's file-scope `library()`
-///   calls. `source()` runs the target's top-level statements at load time,
-///   so any attach calls take effect in the caller's search path.
+/// - `target.attached_packages(db)` for the target's top-level `library()`
+///   calls, the ones `source()` actually runs. A `library()` buried in a
+///   function body has not run at source time, so it is excluded.
 ///
 /// Both return PartialEq-stable values (a `FileExports` map and a
 /// `Vec<String>` respectively), so body-only edits to the target backdate
@@ -36,21 +44,46 @@ use crate::RootKind;
 /// on the narrow queries).
 pub(crate) struct SalsaImportsResolver<'db> {
     db: &'db dyn Db,
-    /// The file currently being indexed. The resolver's whole job is to
-    /// answer import queries on its behalf. Today the only such query
-    /// is `resolve_source()`.
-    calling_file: File,
+    /// The file currently being indexed.
+    file: File,
+    cache: EffectsCache,
 }
 
 impl<'db> SalsaImportsResolver<'db> {
-    pub(crate) fn new(db: &'db dyn Db, calling_file: File) -> Self {
-        Self { db, calling_file }
+    pub(crate) fn new(db: &'db dyn Db, file: File) -> Self {
+        Self {
+            db,
+            file,
+            cache: EffectsCache::default(),
+        }
+    }
+}
+
+/// Per-build memo for `resolve_effects`, keyed on `(name, attached)`.
+/// Sound because the answer only depends on the frozen db, and a
+/// `SalsaImportsResolver` lives exactly as long as one `File::semantic_index`
+/// build.
+#[derive(Default)]
+struct EffectsCache {
+    entries: FxHashMap<Vec<String>, FxHashMap<String, Option<EffectsHandlers>>>,
+}
+
+impl EffectsCache {
+    fn get(&self, name: &str, attached: &[String]) -> Option<Option<EffectsHandlers>> {
+        self.entries.get(attached)?.get(name).copied()
+    }
+
+    fn insert(&mut self, name: &str, attached: &[String], effects: Option<EffectsHandlers>) {
+        self.entries
+            .entry(attached.to_vec())
+            .or_default()
+            .insert(name.to_string(), effects);
     }
 }
 
 impl<'db> ImportsResolver for SalsaImportsResolver<'db> {
     fn resolve_source(&mut self, path: &str) -> Option<SourceResolution> {
-        let anchor = anchor_dir(self.db, self.calling_file)?;
+        let anchor = anchor_dir(self.db, self.file)?;
         let target_path = resolve_relative_to(&anchor, path)?;
         // TODO: a `source()` target outside every workspace root never becomes
         // a `File`, so `file_by_path()` misses it and the names it injects stay
@@ -71,6 +104,7 @@ impl<'db> ImportsResolver for SalsaImportsResolver<'db> {
             .iter()
             .map(|(name, _)| name.to_string())
             .collect();
+
         let packages: Vec<String> = file
             .attached_packages(self.db)
             .iter()
@@ -83,6 +117,162 @@ impl<'db> ImportsResolver for SalsaImportsResolver<'db> {
             packages,
         })
     }
+
+    fn resolve_effects(&mut self, name: &str, attached: &[String]) -> Option<EffectsHandlers> {
+        if let Some(effects) = self.cache.get(name, attached) {
+            return effects;
+        }
+        let effects = self.resolve_effects_uncached(name, attached);
+        self.cache.insert(name, attached, effects);
+        effects
+    }
+
+    fn package_exists(&mut self, package: &str) -> bool {
+        self.db.package_by_name(package).is_some()
+    }
+}
+
+/// What a package layer contributes for `name` as the walk reaches it.
+enum PackageBinding {
+    /// Binds `name` and it carries an effect.
+    Effect(EffectsHandlers),
+    /// Binds `name` (exports it) but with no known effect, e.g. a plain
+    /// exported function. It still shadows any same-named effect deeper on the
+    /// search path, so the walk stops here with no effect.
+    Shadow,
+    /// Doesn't bind `name`, the walk keeps going.
+    Absent,
+}
+
+impl<'db> SalsaImportsResolver<'db> {
+    /// Walks the same load-time layer chain as `File::resolve`, but maps each
+    /// layer to an NSE effect instead of a definition.
+    ///
+    /// Always the eager (predecessors-only) view, even for a lazy callee. A
+    /// top-level callee only sees names loaded before it, so eager is exact
+    /// there. A lazy callee (a function body) runs after the whole package
+    /// has loaded, so R would resolve it against every sibling, and
+    /// `File::resolve` does use the lazy view for that case. We can't here.
+    /// This runs while the file's own index is being built, and the lazy
+    /// view would read a collation successor's `exports`, whose own build
+    /// reads back into this file and cycles (salsa recovers with empty
+    /// exports, so the extra shadow detection it would buy is degraded
+    /// anyway).
+    ///
+    /// A later sibling that shadows a lazy NSE call is missed here, and nothing
+    /// flags it.
+    ///
+    /// TODO(diagnostics): Detect it in the post-index diagnostics query, where
+    /// reading a successor's `exports` doesn't cycle. Unlike the ambiguities the
+    /// builder records, this one can't be seen from inside the file.
+    fn resolve_effects_uncached(&self, name: &str, attached: &[String]) -> Option<EffectsHandlers> {
+        let layers = self.file.cross_file_layers(self.db, CollationView::Eager);
+
+        // The file's own attaches slot between the definition/namespace band
+        // and the rest of the search path, exactly as in `File::imports`.
+        // `attached` is the builder's flow-ordered set (latest last), so
+        // eager/lazy flow-sensitivity is already applied; reverse it to LIFO so
+        // a later attach shadows an earlier one.
+        let own: Vec<ImportLayer> = attached
+            .iter()
+            .rev()
+            .filter_map(|package| self.db.package_by_name(package).map(ImportLayer::Package))
+            .collect();
+
+        for layer in layers.lookup_order(&own) {
+            if let ControlFlow::Break(effect) = self.layer_effect(layer, name) {
+                return effect;
+            }
+        }
+
+        // base is the bottom of every R search path and is present in any
+        // session, so its builtins (`library`, `source`, `quote`, `local`, ...)
+        // resolve by name here even when base isn't scanned into a root. A
+        // definition or a higher package on the path shadows it, which the walk
+        // above already handled before falling through.
+        effects::lookup("base", name).copied()
+    }
+
+    /// Project one import layer to an NSE effect, the effects-side twin of
+    /// `resolve_import_layer` in `file_resolve`. Both reduce the layer to the
+    /// package it binds `name` to and split on the same cases. Only the
+    /// projection differs (definition there, effect here).
+    ///
+    /// Shadowing is export-driven, matching how the definition side stops at the
+    /// first package that resolves `name`. `Break(Some(effect))` found an
+    /// effect. `Break(None)` hit a binding with no effect (a sibling definition,
+    /// a plain package export, a namespace import), which shadows any deeper
+    /// effect, so the bare call is not NSE. `Continue` means the layer doesn't
+    /// bind `name`; keep walking.
+    fn layer_effect(
+        &self,
+        layer: &ImportLayer,
+        name: &str,
+    ) -> ControlFlow<Option<EffectsHandlers>> {
+        match layer {
+            // A definition shadows any deeper effect. Own-file definitions never
+            // reach here, the builder handles them before calling us.
+            ImportLayer::File(file) => match file.exports(self.db).get(name).is_some() {
+                true => ControlFlow::Break(None),
+                false => ControlFlow::Continue(()),
+            },
+            ImportLayer::Package(package) => match self.package_binding(*package, name) {
+                PackageBinding::Effect(effects) => ControlFlow::Break(Some(effects)),
+                PackageBinding::Shadow => ControlFlow::Break(None),
+                PackageBinding::Absent => ControlFlow::Continue(()),
+            },
+            // A NAMESPACE `importFrom` binds `name` unconditionally (that's what
+            // the directive asserts), so it always shadows the search path
+            // below. Its effect, if any, comes from the source package.
+            ImportLayer::From(importer) => match importer.imported_from(self.db).get(name) {
+                Some(source) => {
+                    let effect = self.db.package_by_name(source).and_then(|package| {
+                        match self.package_binding(package, name) {
+                            PackageBinding::Effect(effects) => Some(effects),
+                            PackageBinding::Shadow | PackageBinding::Absent => None,
+                        }
+                    });
+                    ControlFlow::Break(effect)
+                },
+                None => ControlFlow::Continue(()),
+            },
+        }
+    }
+
+    /// How `package` binds `name`: a direct registry effect, a plain export that
+    /// only shadows, or nothing. The re-export chase is one hop through an
+    /// `importFrom`, since a re-exported function's annotation lives under its
+    /// original package, not the re-exporter.
+    fn package_binding(&self, package: Package, name: &str) -> PackageBinding {
+        let package_name = package.name(self.db).as_str();
+        if let Some(effects) = effects::lookup(package_name, name) {
+            return PackageBinding::Effect(*effects);
+        }
+        // base is the terminal layer, so it has nothing below to shadow, and we
+        // don't carry its full builtin export list. Treat it as unbound here;
+        // its effects resolve through the registry lookup above (and the base
+        // fallthrough in `resolve_effects`).
+        if package_name == "base" {
+            return PackageBinding::Absent;
+        }
+        // The package binds `name` only when it exports it. This is the same
+        // export gate `Package::resolve` applies. A name it `importFrom`s
+        // without re-exporting isn't visible to a caller that attaches or
+        // imports this package (R errors "could not find function").
+        let namespace = package.namespace(self.db);
+        if !namespace.exports.contains_str(name) {
+            return PackageBinding::Absent;
+        }
+        // Exports `name`, so it binds. Chase a re-export for the effect; a plain
+        // own definition (no matching `importFrom`) only shadows.
+        match package.imported_from(self.db).get(name) {
+            Some(source) => match effects::lookup(source, name) {
+                Some(effects) => PackageBinding::Effect(*effects),
+                None => PackageBinding::Shadow,
+            },
+            None => PackageBinding::Shadow,
+        }
+    }
 }
 
 /// Anchor directory for relative `source("path")` arguments.
@@ -91,16 +281,13 @@ impl<'db> ImportsResolver for SalsaImportsResolver<'db> {
 /// resolves `source("foo.R")` against `getwd()`, and IDEs (RStudio, Positron)
 /// `setwd()` to the project root, so workspace-root anchoring typically matches
 /// the runtime behaviour.
-fn anchor_dir(db: &dyn Db, calling_file: File) -> Option<Utf8PathBuf> {
-    if let Some(root) = calling_file
-        .root(db)
-        .filter(|r| r.kind(db) == RootKind::Workspace)
-    {
+fn anchor_dir(db: &dyn Db, file: File) -> Option<Utf8PathBuf> {
+    if let Some(root) = file.root(db).filter(|r| r.kind(db) == RootKind::Workspace) {
         // Workspace roots are file URLs by construction.
         return root.path(db).as_path().map(Utf8Path::to_path_buf);
     }
 
-    let parent = calling_file.path(db).as_path()?.parent()?;
+    let parent = file.path(db).as_path()?.parent()?;
     Some(parent.to_path_buf())
 }
 

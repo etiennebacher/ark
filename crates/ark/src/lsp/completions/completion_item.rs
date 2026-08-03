@@ -23,17 +23,17 @@ use libr::PROMSXP;
 use libr::PRVALUE;
 use libr::SEXP;
 use stdext::*;
-use tower_lsp::lsp_types::Command;
-use tower_lsp::lsp_types::CompletionItem;
-use tower_lsp::lsp_types::CompletionItemKind;
-use tower_lsp::lsp_types::CompletionItemLabelDetails;
-use tower_lsp::lsp_types::CompletionTextEdit;
-use tower_lsp::lsp_types::Documentation;
-use tower_lsp::lsp_types::InsertTextFormat;
-use tower_lsp::lsp_types::MarkupContent;
-use tower_lsp::lsp_types::MarkupKind;
-use tower_lsp::lsp_types::Range;
-use tower_lsp::lsp_types::TextEdit;
+use tower_lsp_server::ls_types::Command;
+use tower_lsp_server::ls_types::CompletionItem;
+use tower_lsp_server::ls_types::CompletionItemKind;
+use tower_lsp_server::ls_types::CompletionItemLabelDetails;
+use tower_lsp_server::ls_types::CompletionTextEdit;
+use tower_lsp_server::ls_types::Documentation;
+use tower_lsp_server::ls_types::InsertTextFormat;
+use tower_lsp_server::ls_types::MarkupContent;
+use tower_lsp_server::ls_types::MarkupKind;
+use tower_lsp_server::ls_types::Range;
+use tower_lsp_server::ls_types::TextEdit;
 use tree_sitter::Node;
 
 use crate::lsp::completions::function_context::ArgumentsStatus;
@@ -310,21 +310,37 @@ pub(super) unsafe fn completion_item_from_dataset(name: &str) -> anyhow::Result<
     Ok(item)
 }
 
-pub(super) unsafe fn completion_item_from_data_variable(
+#[derive(Copy, Clone)]
+pub(super) enum QuoteStyle {
+    // Double quote with `"`
+    Double,
+
+    // Backtick with `\`` if the symbol isn't syntactic
+    BacktickIfNotSyntactic,
+
+    // No quoting. Useful if you know you're already inserting into an existing string.
+    None,
+}
+
+pub(super) fn completion_item_from_data_variable(
     name: &str,
     owner: &str,
-    enquote: bool,
+    quote_style: QuoteStyle,
 ) -> anyhow::Result<CompletionItem> {
     let mut item = completion_item(name, CompletionData::DataVariable {
         name: name.to_string(),
         owner: owner.to_string(),
     })?;
 
-    if enquote {
-        item.insert_text = Some(format!("\"{}\"", name));
-    } else if !is_valid_symbol(name) {
-        item.insert_text = Some(sym_quote(name));
-    }
+    match quote_style {
+        QuoteStyle::Double => item.insert_text = Some(format!("\"{name}\"")),
+        QuoteStyle::BacktickIfNotSyntactic => {
+            if !is_valid_symbol(name) {
+                item.insert_text = Some(sym_quote(name));
+            }
+        },
+        QuoteStyle::None => (),
+    };
 
     item.detail = Some(owner.to_string());
     item.kind = Some(CompletionItemKind::VARIABLE);

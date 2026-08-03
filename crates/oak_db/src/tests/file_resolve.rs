@@ -1,6 +1,10 @@
+use oak_package_metadata::namespace::Import;
+use oak_package_metadata::namespace::Namespace;
 use salsa::Setter;
+use stdext::SortedVec;
 
 use crate::tests::test_db::file_path;
+use crate::tests::test_db::make_package;
 use crate::tests::test_db::workspace_root;
 use crate::tests::test_db::TestDb;
 use crate::DbInputs;
@@ -300,6 +304,36 @@ fn test_name_range_for_string_as_name() {
 }
 
 #[test]
+fn test_name_range_for_assign_call() {
+    // `assign("x", 1)` binds `x` through the base `assign` effect. Goto lands on
+    // the name literal, so the range covers the quoted `"x"` argument.
+    let mut db = TestDb::new();
+    let source = "assign(\"x\", 1)\n";
+    let files = setup_workspace(&mut db, &[("w/a.R", source)]);
+    let def = resolve_one(&db, files[0], "x");
+    let range = def.name_range(&db).expect("assign() def has a name range");
+    assert_eq!(slice(source, range), "\"x\"");
+}
+
+#[test]
+fn test_resolve_from_assign_definition_site() {
+    // Cursor on the `"x"` name of `assign("x", 1)` resolves to its own binding,
+    // so goto/rename can start from the definition site. The def's range is the
+    // name token, not an empty span, which is what `definition_at` hit-tests.
+    use biome_rowan::TextSize;
+    use oak_semantic::semantic_index::DefinitionKind;
+
+    let mut db = TestDb::new();
+    let source = "assign(\"x\", 1)\n";
+    let files = setup_workspace(&mut db, &[("w/a.R", source)]);
+    let offset = source.find("\"x\"").unwrap();
+
+    let defs = files[0].resolve_at(&db, TextSize::from(offset as u32));
+    assert_eq!(defs.len(), 1);
+    assert!(matches!(defs[0].kind(&db), DefinitionKind::Assign { .. }));
+}
+
+#[test]
 fn test_name_range_returns_none_for_import_kind() {
     // `File::resolve` chases past every `Import` and only ever returns a
     // `Local`-kinded `Definition`, so the `Import` arm of `name_range` is
@@ -550,6 +584,7 @@ fn test_resolve_unbound_name_in_package_does_not_cycle() {
         FileRevision::zero(),
         FileRevision::zero(),
         None,
+        None,
         Vec::new(),
         Vec::new(),
     );
@@ -591,6 +626,7 @@ fn test_resolve_walks_package_files_for_lazy_lookups() {
         "pkg".to_string(),
         FileRevision::zero(),
         FileRevision::zero(),
+        None,
         None,
         Vec::new(),
         Vec::new(),
@@ -635,6 +671,7 @@ fn test_resolve_if_else_in_collated_file_offers_both() {
         "pkg".to_string(),
         FileRevision::zero(),
         FileRevision::zero(),
+        None,
         Some(oak_package_metadata::namespace::Namespace::default()),
         Vec::new(),
         Vec::new(),
@@ -687,6 +724,7 @@ fn test_resolve_collated_sequential_redef_resolves_to_last() {
         "pkg".to_string(),
         FileRevision::zero(),
         FileRevision::zero(),
+        None,
         Some(oak_package_metadata::namespace::Namespace::default()),
         Vec::new(),
         Vec::new(),
@@ -723,4 +761,73 @@ fn test_resolve_collated_sequential_redef_resolves_to_last() {
         ),
         12
     );
+}
+
+#[test]
+fn test_resolve_finds_definition_through_sibling_library_attach() {
+    // `a.R` does `library(dep)`; by the time the rest of the package loads, dep
+    // is on the search path, so `b.R`'s unbound `dep_fn` resolves to dep's
+    // exported binding. This is the predecessor-attach layer `imports()` now
+    // carries (previously `resolve` never saw a sibling's `library()`).
+    let mut db = TestDb::new();
+    let root = workspace_root(&db, "ws");
+    let (pkg, files) = make_package(&mut db, "pkg", Namespace::default(), &[
+        ("ws/pkg/R/a.R", "library(dep)\n"),
+        ("ws/pkg/R/b.R", "use <- function() dep_fn\n"),
+    ]);
+    let dep_ns = Namespace {
+        exports: SortedVec::from_vec(vec!["dep_fn".to_string()]),
+        ..Default::default()
+    };
+    let (dep, dep_files) = make_package(&mut db, "dep", dep_ns, &[(
+        "ws/dep/R/z.R",
+        "dep_fn <- function() 1\n",
+    )]);
+    root.set_packages(&mut db).to(vec![pkg, dep]);
+    db.workspace_roots().set_roots(&mut db).to(vec![root]);
+
+    let def = resolve_one(&db, files[1], "dep_fn");
+    assert_eq!(def.file(&db), dep_files[0]);
+    assert_eq!(def.name(&db).text(&db).as_str(), "dep_fn");
+}
+
+#[test]
+fn test_resolve_namespace_import_beats_attached_package() {
+    // The package imports `foo` from `depA` via NAMESPACE, and `a.R` also
+    // attaches `depB`, which exports `foo` too. R searches the namespace before
+    // the attached search path, so `foo` resolves to depA's binding, not depB's.
+    let mut db = TestDb::new();
+    let root = workspace_root(&db, "ws");
+    let namespace = Namespace {
+        imports: vec![Import {
+            name: "foo".to_string(),
+            package: "depA".to_string(),
+        }],
+        ..Default::default()
+    };
+    let (pkg, files) = make_package(&mut db, "pkg", namespace, &[(
+        "ws/pkg/R/a.R",
+        "library(depB)\nuse <- function() foo\n",
+    )]);
+    let dep_a_ns = Namespace {
+        exports: SortedVec::from_vec(vec!["foo".to_string()]),
+        ..Default::default()
+    };
+    let (dep_a, dep_a_files) = make_package(&mut db, "depA", dep_a_ns, &[(
+        "ws/depA/R/z.R",
+        "foo <- function() 1\n",
+    )]);
+    let dep_b_ns = Namespace {
+        exports: SortedVec::from_vec(vec!["foo".to_string()]),
+        ..Default::default()
+    };
+    let (dep_b, _) = make_package(&mut db, "depB", dep_b_ns, &[(
+        "ws/depB/R/z.R",
+        "foo <- function() 2\n",
+    )]);
+    root.set_packages(&mut db).to(vec![pkg, dep_a, dep_b]);
+    db.workspace_roots().set_roots(&mut db).to(vec![root]);
+
+    let def = resolve_one(&db, files[0], "foo");
+    assert_eq!(def.file(&db), dep_a_files[0]);
 }

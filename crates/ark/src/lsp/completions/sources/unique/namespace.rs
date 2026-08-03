@@ -14,7 +14,7 @@ use libr::R_lsInternal;
 use libr::Rboolean_TRUE;
 use libr::Rf_findVarInFrame;
 use libr::SEXP;
-use tower_lsp::lsp_types::CompletionItem;
+use tower_lsp_server::ls_types::CompletionItem;
 use tree_sitter::Node;
 use tree_sitter::Point;
 
@@ -240,7 +240,7 @@ fn list_namespace_exports(namespace: SEXP) -> RObject {
 
 #[cfg(test)]
 mod tests {
-    use tower_lsp::lsp_types::CompletionItem;
+    use tower_lsp_server::ls_types::CompletionItem;
 
     use crate::fixtures::point_from_cursor;
     use crate::lsp::completions::completion_context::CompletionContext;
@@ -256,7 +256,7 @@ mod tests {
         let (text, point) = point_from_cursor(cursor_text);
         let doc = TestDocument::new(&text);
         let document_context = doc.context(point);
-        let state = WorldState::default();
+        let state = WorldState::default().snapshot();
         let context = CompletionContext::new(&document_context, &state);
 
         completions_from_namespace(&context)

@@ -4,6 +4,7 @@ use salsa::Setter;
 
 use crate::tests::test_db::file_path;
 use crate::tests::test_db::library_root;
+use crate::tests::test_db::make_package;
 use crate::tests::test_db::workspace_root;
 use crate::tests::test_db::TestDb;
 use crate::DbInputs;
@@ -24,6 +25,7 @@ fn make_installed(db: &mut TestDb, name: &str) -> (crate::Root, Package) {
         name.to_string(),
         FileRevision::zero(),
         FileRevision::zero(),
+        None,
         None,
         Vec::new(),
         Vec::new(),
@@ -49,9 +51,15 @@ fn install_packages(db: &mut TestDb, names: &[&str]) -> Vec<Package> {
 #[test]
 fn test_script_with_no_attaches_returns_only_default_search_path() {
     let mut db = TestDb::new();
-    let packages = install_packages(&mut db, &["base", "stats"]);
-    let base = packages[0];
-    let stats = packages[1];
+    install_packages(&mut db, &[
+        "stats",
+        "graphics",
+        "grDevices",
+        "utils",
+        "datasets",
+        "methods",
+        "base",
+    ]);
 
     let file = File::new(
         &db,
@@ -60,26 +68,26 @@ fn test_script_with_no_attaches_returns_only_default_search_path() {
         Some("x <- 1\n".to_string()),
         None,
     );
-    let layers = file.imports(&db);
 
-    // Only `stats` and `base` are registered in this test; the other
-    // default-search-path packages are absent and drop out.
-    let packages: Vec<Package> = layers
-        .iter()
-        .map(|layer| match layer {
-            ImportLayer::Package(p) => *p,
-            other => panic!("unexpected layer: {other:?}"),
-        })
-        .collect();
-    assert_eq!(packages, vec![stats, base]);
+    // The whole default search path shows up as `Package` layers in R's
+    // `search()` order (`stats` first, `base` last).
+    assert_eq!(shape(&db, file.imports(&db)), vec![
+        "Package(stats)".to_string(),
+        "Package(graphics)".to_string(),
+        "Package(grDevices)".to_string(),
+        "Package(utils)".to_string(),
+        "Package(datasets)".to_string(),
+        "Package(methods)".to_string(),
+        "Package(base)".to_string(),
+    ]);
 }
 
 #[test]
 fn test_script_attach_produces_package_exports_layer_in_lifo_order() {
     let mut db = TestDb::new();
-    let packages = install_packages(&mut db, &["dplyr", "ggplot2"]);
-    let dplyr = packages[0];
-    let ggplot2 = packages[1];
+    // Only the attached packages are installed, so the default search path
+    // drops out and the assertion sees just the two `library()` calls.
+    install_packages(&mut db, &["dplyr", "ggplot2"]);
 
     let file = File::new(
         &db,
@@ -88,25 +96,20 @@ fn test_script_attach_produces_package_exports_layer_in_lifo_order() {
         Some("library(dplyr)\nlibrary(ggplot2)\n".to_string()),
         None,
     );
-    let layers = file.imports(&db);
 
-    let attached: Vec<Package> = layers
-        .iter()
-        .filter_map(|layer| match layer {
-            ImportLayer::Package(p) => Some(*p),
-            _ => None,
-        })
-        .collect();
-
-    // LIFO: latest `library()` call comes first (matching R's runtime
-    // search order). Then the default search path (empty in this setup).
-    assert_eq!(attached, vec![ggplot2, dplyr]);
+    // LIFO: latest `library()` call comes first (matching R's runtime search
+    // order).
+    assert_eq!(shape(&db, file.imports(&db)), vec![
+        "Package(ggplot2)".to_string(),
+        "Package(dplyr)".to_string(),
+    ]);
 }
 
 #[test]
 fn test_script_attach_to_unregistered_package_drops_layer() {
     let db = TestDb::new();
-    // No `dplyr` in any library root.
+    // No `dplyr` (or default search path) in any root, so nothing has a
+    // `Package` entity and every layer drops out.
     let file = File::new(
         &db,
         file_path("a.R"),
@@ -115,8 +118,7 @@ fn test_script_attach_to_unregistered_package_drops_layer() {
         None,
     );
 
-    let layers = file.imports(&db);
-    assert!(layers.is_empty());
+    assert!(file.imports(&db).is_empty());
 }
 
 #[test]
@@ -144,6 +146,7 @@ fn test_package_file_emits_namespace_and_collation_layers() {
         "pkg".to_string(),
         FileRevision::zero(),
         FileRevision::zero(),
+        None,
         Some(namespace),
         Vec::new(),
         Vec::new(),
@@ -171,9 +174,12 @@ fn test_package_file_emits_namespace_and_collation_layers() {
     let mut shape = Vec::new();
     for layer in layers {
         match layer {
-            ImportLayer::From(map) => {
-                let mut entries: Vec<(String, String)> =
-                    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            ImportLayer::From(package) => {
+                let mut entries: Vec<(String, String)> = package
+                    .imported_from(&db)
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 entries.sort();
                 shape.push(format!("From({entries:?})"));
             },
@@ -221,6 +227,7 @@ fn test_package_script_resolves_as_standalone_script() {
         FileRevision::zero(),
         FileRevision::zero(),
         None,
+        None,
         Vec::new(),
         Vec::new(),
     );
@@ -244,9 +251,9 @@ fn test_package_script_resolves_as_standalone_script() {
     db.workspace_roots().set_roots(&mut db).to(vec![workspace]);
 
     let _ = dplyr;
-    // Only its own `library(dplyr)` and `base` from the default search path
-    // (the only other registered package). `R/a.R` and the namespace are
-    // absent because the script isn't part of the package's namespace.
+    // Its own `library(dplyr)` on top of the default search path (only `base`
+    // installed here). `R/a.R` and the namespace are absent because the script
+    // isn't part of the package's namespace.
     assert_eq!(shape(&db, data_raw.imports(&db)), vec![
         "Package(dplyr)".to_string(),
         "Package(base)".to_string(),
@@ -267,6 +274,7 @@ fn test_testthat_file_sees_helpers_package_and_testthat() {
         "pkg".to_string(),
         FileRevision::zero(),
         FileRevision::zero(),
+        None,
         None,
         Vec::new(),
         Vec::new(),
@@ -345,6 +353,7 @@ fn test_package_r_file_does_not_take_testthat_path() {
         FileRevision::zero(),
         FileRevision::zero(),
         None,
+        None,
         Vec::new(),
         Vec::new(),
     );
@@ -391,6 +400,7 @@ fn test_testthat_file_includes_top_level_library_calls() {
         FileRevision::zero(),
         FileRevision::zero(),
         None,
+        None,
         Vec::new(),
         Vec::new(),
     );
@@ -426,15 +436,106 @@ fn test_testthat_file_includes_top_level_library_calls() {
     ]);
 }
 
+#[test]
+fn test_package_file_includes_predecessor_attaches() {
+    // A collation predecessor's own `library(dep)` puts dep on the search path
+    // for files loaded after it, so `b.R`'s imports carry it as a `Package`
+    // layer, below the predecessor's `File` layer and above `base`.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["dep", "base"]);
+    let workspace = workspace_root(&db, "w");
+    let pkg = Package::new(
+        &db,
+        file_path("w/pkg/DESCRIPTION"),
+        "pkg".to_string(),
+        FileRevision::zero(),
+        FileRevision::zero(),
+        None,
+        Some(Namespace::default()),
+        Vec::new(),
+        Vec::new(),
+    );
+    let a = File::new(
+        &db,
+        file_path("w/pkg/R/a.R"),
+        FileRevision::zero(),
+        Some("library(dep)\n".to_string()),
+        Some(pkg),
+    );
+    let b = File::new(
+        &db,
+        file_path("w/pkg/R/b.R"),
+        FileRevision::zero(),
+        Some("x <- 1\n".to_string()),
+        Some(pkg),
+    );
+    pkg.set_files(&mut db).to(vec![a, b]);
+    workspace.set_packages(&mut db).to(vec![pkg]);
+    db.workspace_roots().set_roots(&mut db).to(vec![workspace]);
+
+    assert_eq!(shape(&db, b.imports(&db)), vec![
+        "File(a.R)".to_string(),
+        "Package(dep)".to_string(),
+        "Package(base)".to_string(),
+    ]);
+}
+
+#[test]
+fn test_testthat_file_includes_package_namespace_imports() {
+    // A test file runs under the package namespace, so the package's
+    // `importFrom(rlang, abort)` shows up as a `From` layer, ranked above the
+    // implicit testthat/base attaches.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["testthat", "base"]);
+    let workspace = workspace_root(&db, "w");
+    let namespace = Namespace {
+        imports: vec![Import {
+            name: "abort".to_string(),
+            package: "rlang".to_string(),
+        }],
+        ..Default::default()
+    };
+    let pkg = Package::new(
+        &db,
+        file_path("w/pkg/DESCRIPTION"),
+        "pkg".to_string(),
+        FileRevision::zero(),
+        FileRevision::zero(),
+        None,
+        Some(namespace),
+        Vec::new(),
+        Vec::new(),
+    );
+    let test_foo = File::new(
+        &db,
+        file_path("w/pkg/tests/testthat/test-foo.R"),
+        FileRevision::zero(),
+        Some("test_that('x', expect_true(TRUE))\n".to_string()),
+        Some(pkg),
+    );
+    pkg.set_scripts(&mut db).to(vec![test_foo]);
+    workspace.set_packages(&mut db).to(vec![pkg]);
+    db.workspace_roots().set_roots(&mut db).to(vec![workspace]);
+
+    assert_eq!(shape(&db, test_foo.imports(&db)), vec![
+        "From([(\"abort\", \"rlang\")])".to_string(),
+        "Package(testthat)".to_string(),
+        "Package(base)".to_string(),
+    ]);
+}
+
 /// Render `ImportLayer`s to a stable, assertable shape. `File` layers
 /// collapse to their basename.
 fn shape(db: &TestDb, layers: &[ImportLayer]) -> Vec<String> {
     layers
         .iter()
         .map(|layer| match layer {
-            ImportLayer::From(map) => {
-                let mut entries: Vec<(String, String)> =
-                    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            ImportLayer::From(package) => {
+                let mut entries: Vec<(String, String)> = package
+                    .imported_from(db)
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 entries.sort();
                 format!("From({entries:?})")
             },
@@ -463,4 +564,54 @@ fn test_imports_is_cached_per_file() {
     let _ = file.imports(&db);
 
     assert_eq!(db.executions("imports"), 1);
+}
+
+#[test]
+fn test_cross_file_layers_cascade_stays_shallow() {
+    // Building a late-collation file resolves its effects, which reaches back
+    // through every predecessor's index. Without the forward-prime in
+    // `predecessor_attach_layers` that walk recurses as deep as the collation,
+    // which is what overflowed the stack in the IDE. Assert the nesting stays
+    // flat regardless of collation length.
+    //
+    // We assert on recursion depth, not "does it crash", because
+    // `stacker::maybe_grow` in `build_semantic_index` grows the stack and would
+    // hide a regression from a crash-based check. Depth is independent of it.
+    let mut db = TestDb::new();
+
+    const N: usize = 150;
+    let owned: Vec<(String, String)> = (0..N)
+        .map(|i| (format!("w/pkg/R/f{i:04}.R"), "local(1)\n".to_string()))
+        .collect();
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_str()))
+        .collect();
+    let (_pkg, entities) = make_package(&mut db, "pkg", Namespace::default(), &files);
+
+    crate::file::recursion_depth::reset();
+
+    // Cold build of the last collation file: its effect resolution demands
+    // every predecessor's index. Forward-priming keeps the nesting shallow.
+    let _ = entities[N - 1].semantic_index(&db);
+
+    assert!(crate::file::recursion_depth::max() < 10);
+}
+
+#[test]
+fn test_cross_file_layers_memoized_across_effect_calls() {
+    // Each effectful call consults `cross_file_layers(file, view)` while the
+    // file's index builds. Memoizing it keeps that to one execution per file
+    // instead of one per call, which was the O(N^2) that froze the LSP.
+    let mut db = TestDb::new();
+
+    let body = "local(1)\n".repeat(20);
+    let (_pkg, entities) = make_package(&mut db, "pkg", Namespace::default(), &[(
+        "w/pkg/R/a.R",
+        &body,
+    )]);
+
+    let _ = entities[0].semantic_index(&db);
+
+    assert_eq!(db.executions("cross_file_layers"), 1);
 }

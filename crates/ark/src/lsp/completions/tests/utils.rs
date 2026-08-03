@@ -4,9 +4,9 @@
 // Copyright (C) 2025 Posit Software, PBC. All rights reserved.
 //
 
-use tower_lsp::lsp_types;
-use tower_lsp::lsp_types::CompletionItem;
-use tower_lsp::lsp_types::CompletionTextEdit;
+use tower_lsp_server::ls_types as lsp_types;
+use tower_lsp_server::ls_types::CompletionItem;
+use tower_lsp_server::ls_types::CompletionTextEdit;
 
 use crate::fixtures::point_from_cursor;
 use crate::lsp::completions::provide_completions;
@@ -18,7 +18,7 @@ pub(crate) fn get_completions_at_cursor(cursor_text: &str) -> anyhow::Result<Vec
     let (text, point) = point_from_cursor(cursor_text);
     let doc = TestDocument::new(&text);
     let document_context = doc.context(point);
-    let state = WorldState::default();
+    let state = WorldState::default().snapshot();
 
     match provide_completions(&document_context, &state) {
         Ok(completions) => Ok(completions),

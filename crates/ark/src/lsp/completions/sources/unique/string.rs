@@ -5,7 +5,7 @@
 //
 //
 
-use tower_lsp::lsp_types::CompletionItem;
+use tower_lsp_server::ls_types::CompletionItem;
 
 use super::file_path::completions_from_string_file_path;
 use crate::lsp::completions::completion_context::CompletionContext;
@@ -132,7 +132,7 @@ mod tests {
             assert_match!(res, Some(items) => { assert!(items.is_empty()) });
 
             // Check for same result when consulting (potentially all) unique sources
-            let state = WorldState::default();
+            let state = WorldState::default().snapshot();
             let completion_context = CompletionContext::new(&context, &state);
             let res = unique::get_completions(&completion_context).unwrap();
 

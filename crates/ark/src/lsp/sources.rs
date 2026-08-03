@@ -11,6 +11,8 @@ use oak_source::SourceCache;
 use oak_srcref::SrcrefCache;
 use stdext::result::ResultExt;
 
+use crate::lsp;
+use crate::lsp::io_pool::IoPool;
 use crate::lsp::main_loop::Event;
 use crate::lsp::main_loop::TokioUnboundedSender;
 
@@ -25,7 +27,7 @@ pub(crate) trait SourceHandler: Send + Sync {
 /// The production [`SourceHandler`]
 ///
 /// Recovers a package's R sources in the following order:
-/// - Base packages come from a downloaded CRAN's R source tarball
+/// - Base packages come from a downloaded base R source archive
 /// - CRAN packages come from:
 ///   - A local `srcref`, if available
 ///   - A downloaded CRAN package tarball
@@ -35,7 +37,7 @@ pub(crate) struct OakSourceHandler {
 }
 
 impl OakSourceHandler {
-    /// Build the handler, opening both caches against the shared on disk cache
+    /// Build the handler, opening every cache against the shared on disk cache
     pub(crate) fn new(r: PathBuf) -> anyhow::Result<Self> {
         Ok(Self {
             srcref: SrcrefCache::open(r)?,
@@ -43,7 +45,7 @@ impl OakSourceHandler {
         })
     }
 
-    /// Build the handler with both caches rooted under `root`, so tests don't touch the
+    /// Build the handler with every cache rooted under `root`, so tests don't touch the
     /// real on disk cache
     #[cfg(test)]
     pub(crate) fn new_in(root: &Path, r: PathBuf) -> anyhow::Result<Self> {
@@ -59,8 +61,8 @@ impl SourceHandler for OakSourceHandler {
         let name = request.name();
         let version = request.version();
 
-        // Base packages only exist in the R version source tarball, served from one
-        // download shared across all of them
+        // Base packages are served from a downloaded base R source archive, keyed by R
+        // version
         if matches!(request.priority(), Some(Priority::Base)) {
             return self
                 .source
@@ -99,9 +101,9 @@ fn r_dir_for_cran(root: &Path) -> PathBuf {
     root.join("R")
 }
 
-/// Find `R/` from a R source tarball for a base package
+/// Find `R/` from a base package tree, laid out as `{name}/R`
 fn r_dir_for_base(root: &Path, name: &str) -> PathBuf {
-    root.join("src").join("library").join(name).join("R")
+    root.join(name).join("R")
 }
 
 #[derive(Debug, Clone)]
@@ -152,14 +154,26 @@ impl SourceScheduler {
         }
     }
 
-    pub(crate) fn schedule(&mut self, db: &dyn Db, events_tx: &TokioUnboundedSender<Event>) {
+    /// Run a fetch for each package we haven't seen before on `pool`, shipping
+    /// each [`SourceResponse`] back to the main loop as
+    /// [`Event::SourceCompleted`], where [`Self::finish`] then applies it.
+    ///
+    /// The job owns no db handle. A download can't be interrupted by a Salsa
+    /// cancellation, so a handle in `pool`'s queue would hold up the next
+    /// main-loop write for the whole fetch.
+    pub(crate) fn schedule(
+        &mut self,
+        db: &dyn Db,
+        pool: &IoPool,
+        events_tx: &TokioUnboundedSender<Event>,
+    ) {
         let Some(handler) = &self.handler else {
             return;
         };
 
-        // For each package used by the workspace, request its sources if we have never
-        // seen it before
-        for package in oak_db::workspace_dependencies(db) {
+        // For each package used across all of the workspace roots, request its sources if
+        // we have never seen it before
+        for package in oak_db::all_package_dependencies(db) {
             if self.state.contains_key(package) {
                 // If we've seen this package before, don't request sources again!
                 continue;
@@ -177,10 +191,16 @@ impl SourceScheduler {
             let handler = Arc::clone(handler);
             let tx = events_tx.clone();
 
-            // Mark as `Pending` just before launching the tokio task
+            // Mark as `Pending` just before launching the job
             self.state.insert(package, SourceState::Pending);
 
-            crate::lsp::spawn_blocking(move || {
+            lsp::log_info!(
+                "Fetching sources for package {name}, {n} pending",
+                name = request.name(),
+                n = self.pending_count(),
+            );
+
+            pool.submit(move || {
                 let response = handler.handle(&request);
 
                 tx.send(Event::SourceCompleted(SourceCompleted {
@@ -188,8 +208,6 @@ impl SourceScheduler {
                     response,
                 }))
                 .log_err();
-
-                Ok(None)
             });
         }
     }
@@ -201,6 +219,14 @@ impl SourceScheduler {
             SourceResponse::Success(directory) => Some(directory),
             SourceResponse::Failure => None,
         }
+    }
+
+    /// How many source requests are in flight
+    fn pending_count(&self) -> usize {
+        self.state
+            .values()
+            .filter(|state| matches!(state, SourceState::Pending))
+            .count()
     }
 
     /// Whether any source request is in flight. Allows tests to deterministically "wait"

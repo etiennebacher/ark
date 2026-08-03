@@ -1,6 +1,7 @@
 use biome_rowan::TextSize;
 use salsa::Setter;
 
+use crate::search::DEFAULT_SEARCH_PATH_PACKAGES;
 use crate::tests::test_db::file_path;
 use crate::tests::test_db::library_root;
 use crate::tests::test_db::workspace_root;
@@ -45,6 +46,7 @@ fn install_packages(db: &mut TestDb, names: &[&str]) -> Vec<Package> {
             FileRevision::zero(),
             FileRevision::zero(),
             None,
+            None,
             Vec::new(),
             Vec::new(),
         );
@@ -67,6 +69,7 @@ fn install_workspace_package(db: &mut TestDb, name: &str) -> Package {
         FileRevision::zero(),
         FileRevision::zero(),
         None,
+        None,
         Vec::new(),
         Vec::new(),
     );
@@ -75,13 +78,24 @@ fn install_workspace_package(db: &mut TestDb, name: &str) -> Package {
     pkg
 }
 
-fn attached_packages(layers: &[ImportLayer]) -> Vec<Package> {
+/// The package names of all `Package` layers, in layer order.
+fn attach_names(db: &TestDb, layers: &[ImportLayer]) -> Vec<String> {
     layers
         .iter()
         .filter_map(|layer| match layer {
-            ImportLayer::Package(p) => Some(*p),
+            ImportLayer::Package(p) => Some(p.name(db).to_string()),
             _ => None,
         })
+        .collect()
+}
+
+/// User `library()` / `require()` attaches, with the always-present default
+/// search path dropped so a narrowing assertion sees only what the cursor's
+/// position changes.
+fn library_attaches(db: &TestDb, layers: &[ImportLayer]) -> Vec<String> {
+    attach_names(db, layers)
+        .into_iter()
+        .filter(|name| !DEFAULT_SEARCH_PATH_PACKAGES.contains(&name.as_str()))
         .collect()
 }
 
@@ -105,15 +119,13 @@ fn test_script_cursor_before_any_attach_sees_no_attached_packages() {
     let file = make_file(&mut db, "/a.R", source);
 
     let layers = file.imports_at(&db, TextSize::from(0));
-    assert_eq!(attached_packages(&layers), Vec::<Package>::new());
+    assert_eq!(library_attaches(&db, &layers), Vec::<String>::new());
 }
 
 #[test]
 fn test_script_cursor_after_all_attaches_sees_all_in_lifo_order() {
     let mut db = TestDb::new();
-    let packages = install_packages(&mut db, &["dplyr", "ggplot2"]);
-    let dplyr = packages[0];
-    let ggplot2 = packages[1];
+    install_packages(&mut db, &["dplyr", "ggplot2"]);
 
     let source = "library(dplyr)\nlibrary(ggplot2)\nx <- 1\n";
     let file = make_file(&mut db, "/a.R", source);
@@ -121,21 +133,23 @@ fn test_script_cursor_after_all_attaches_sees_all_in_lifo_order() {
     let offset = TextSize::from(source.len() as u32);
     let layers = file.imports_at(&db, offset);
     // LIFO: latest `library()` call comes first.
-    assert_eq!(attached_packages(&layers), vec![ggplot2, dplyr]);
+    assert_eq!(library_attaches(&db, &layers), vec![
+        "ggplot2".to_string(),
+        "dplyr".to_string()
+    ]);
 }
 
 #[test]
 fn test_script_cursor_between_attaches_sees_only_earlier_ones() {
     let mut db = TestDb::new();
-    let packages = install_packages(&mut db, &["dplyr", "ggplot2"]);
-    let dplyr = packages[0];
+    install_packages(&mut db, &["dplyr", "ggplot2"]);
 
     let source = "library(dplyr)\nlibrary(ggplot2)\nx <- 1\n";
     let file = make_file(&mut db, "/a.R", source);
 
     let offset = TextSize::from(source.find("library(ggplot2)").unwrap() as u32);
     let layers = file.imports_at(&db, offset);
-    assert_eq!(attached_packages(&layers), vec![dplyr]);
+    assert_eq!(library_attaches(&db, &layers), vec!["dplyr".to_string()]);
 }
 
 #[test]
@@ -145,15 +159,14 @@ fn test_function_body_sees_file_scope_attaches_even_if_after_function_in_source(
     // order. The offset filter must override its "before cursor" rule for
     // file-scope attaches when the cursor is inside a function body.
     let mut db = TestDb::new();
-    let packages = install_packages(&mut db, &["dplyr"]);
-    let dplyr = packages[0];
+    install_packages(&mut db, &["dplyr"]);
 
     let source = "f <- function() {\n  x\n}\nlibrary(dplyr)\n";
     let file = make_file(&mut db, "/a.R", source);
 
     let offset = TextSize::from(source.find("x\n}").unwrap() as u32);
     let layers = file.imports_at(&db, offset);
-    assert!(attached_packages(&layers).contains(&dplyr));
+    assert!(library_attaches(&db, &layers).contains(&"dplyr".to_string()));
 }
 
 #[test]
@@ -219,15 +232,14 @@ fn test_package_top_level_predecessors_appear_in_lifo_order() {
 #[test]
 fn test_package_namespace_and_base_layers_always_visible() {
     let mut db = TestDb::new();
-    let packages = install_packages(&mut db, &["base"]);
-    let base = packages[0];
+    install_packages(&mut db, &["base"]);
     let pkg = install_workspace_package(&mut db, "pkg");
 
     let file = make_package_file(&mut db, "/w/pkg/R/a.R", "x <- 1\n", pkg);
     pkg.set_files(&mut db).to(vec![file]);
 
     let layers = file.imports_at(&db, TextSize::from(0));
-    assert!(attached_packages(&layers).contains(&base));
+    assert!(attach_names(&db, &layers).contains(&"base".to_string()));
 }
 
 #[test]
@@ -237,7 +249,7 @@ fn test_package_script_top_level_resolves_as_standalone_script() {
     // script and never take the package path, which would log the spurious
     // "back-pointer but not in its files" warning from #1270.
     let mut db = TestDb::new();
-    let dplyr = install_packages(&mut db, &["dplyr"])[0];
+    install_packages(&mut db, &["dplyr"]);
     let pkg = install_workspace_package(&mut db, "pkg");
 
     let r_file = make_package_file(&mut db, "/workspace/pkg/R/a.R", "internal <- 1\n", pkg);
@@ -249,12 +261,12 @@ fn test_package_script_top_level_resolves_as_standalone_script() {
     // Before the `library()` call: nothing attached, and no `R/` `File`
     // layers (the script isn't part of the package's namespace).
     let before = data_raw.imports_at(&db, TextSize::from(0));
-    assert_eq!(attached_packages(&before), Vec::<Package>::new());
+    assert_eq!(library_attaches(&db, &before), Vec::<String>::new());
     assert_eq!(package_files(&before), Vec::<File>::new());
 
     // After the call: dplyr attached, still no `R/` `File` layers.
     let after = data_raw.imports_at(&db, TextSize::from(source.len() as u32));
-    assert_eq!(attached_packages(&after), vec![dplyr]);
+    assert_eq!(library_attaches(&db, &after), vec!["dplyr".to_string()]);
     assert_eq!(package_files(&after), Vec::<File>::new());
 }
 
@@ -264,7 +276,7 @@ fn test_testthat_top_level_library_narrows_by_offset() {
     // invisible before the call, visible after. Helpers, the package, and
     // testthat (omitted here) stay visible at any offset.
     let mut db = TestDb::new();
-    let cli = install_packages(&mut db, &["cli", "testthat", "base"])[0];
+    install_packages(&mut db, &["cli"]);
     let pkg = install_workspace_package(&mut db, "pkg");
 
     let source = "library(cli)\ntest_that('x', expect_true(TRUE))\n";
@@ -277,23 +289,21 @@ fn test_testthat_top_level_library_narrows_by_offset() {
     pkg.set_scripts(&mut db).to(vec![test_file]);
 
     let before = test_file.imports_at(&db, TextSize::from(0));
-    assert!(!attached_packages(&before).contains(&cli));
+    assert!(!library_attaches(&db, &before).contains(&"cli".to_string()));
 
     let after = test_file.imports_at(&db, TextSize::from(source.len() as u32));
-    assert!(attached_packages(&after).contains(&cli));
+    assert!(library_attaches(&db, &after).contains(&"cli".to_string()));
 }
 
 #[test]
 fn test_library_in_function_scoped_source_is_visible_only_in_that_function() {
-    // A `library()` inside a file that's `source()`d from a function body is
-    // forwarded by the builder as an `Attach` scoped to that `source()` call,
-    // so its `Package` layer is visible inside the function (the lazy / EOF
-    // view) but not at file scope before or after it.
+    // A sourced `library()` becomes an `Attach` in `source()`'s calling scope.
+    // It appears after `source()` returns, but does not escape the function.
     let mut db = TestDb::new();
-    let dplyr = install_packages(&mut db, &["dplyr"])[0];
+    install_packages(&mut db, &["dplyr"]);
 
     let helpers = make_file(&mut db, "w/helpers.R", "library(dplyr)\n");
-    let script_src = "before\nf <- function() {\n  source(\"helpers.R\")\n}\nafter\n";
+    let script_src = "before\nf <- function() {\n  source(\"helpers.R\")\n  inside\n}\nafter\n";
     let script = make_file(&mut db, "w/script.R", script_src);
 
     let root = workspace_root(&db, "w");
@@ -302,10 +312,426 @@ fn test_library_in_function_scoped_source_is_visible_only_in_that_function() {
 
     let at = |needle: &str| {
         let offset = TextSize::from(script_src.find(needle).unwrap() as u32);
-        attached_packages(&script.imports_at(&db, offset))
+        library_attaches(&db, &script.imports_at(&db, offset))
     };
 
-    assert!(!at("before").contains(&dplyr));
-    assert!(at("source").contains(&dplyr));
-    assert!(!at("after").contains(&dplyr));
+    assert!(!at("before").contains(&"dplyr".to_string()));
+    assert!(!at("source").contains(&"dplyr".to_string()));
+    assert!(at("inside").contains(&"dplyr".to_string()));
+    assert!(!at("after").contains(&"dplyr".to_string()));
+}
+
+/// The attaches visible at each `needle` in `source`, one entry per needle.
+fn attaches_at(db: &TestDb, file: File, source: &str, needles: &[&str]) -> Vec<Vec<String>> {
+    needles
+        .iter()
+        .map(|needle| {
+            let offset = TextSize::from(source.find(needle).unwrap() as u32);
+            library_attaches(db, &file.imports_at(db, offset))
+        })
+        .collect()
+}
+
+#[test]
+fn test_conditional_attach_holds_only_inside_its_branch() {
+    // `library(cli)` runs only when `cond` is true, so past the branch nothing
+    // says cli is attached. It covers its own arm and stops at the closing
+    // brace, the same narrowing the scan applies to `attached_so_far`.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "before\nif (cond) {\n  library(cli)\n  inside\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    let no_attach: Vec<String> = Vec::new();
+    assert_eq!(
+        attaches_at(&db, file, source, &["before", "inside", "after"]),
+        vec![no_attach.clone(), vec!["cli".to_string()], no_attach]
+    );
+}
+
+#[test]
+fn test_conditional_attach_does_not_reach_the_sibling_branch() {
+    // The arm that attaches ends before the `else` starts, so the alternative
+    // resolves against the search path as it was before the `if`.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "if (cond) {\n  library(cli)\n  taken\n} else {\n  other\n}\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["taken", "other"]), vec![
+        vec!["cli".to_string()],
+        Vec::<String>::new()
+    ]);
+}
+
+#[test]
+fn test_attach_on_both_branches_holds_after_the_if() {
+    // Both arms attach `cli`, so the join carries one attach past the `if`.
+    // This distinguishes effect regions from treating every attach inside an `if`
+    // as conditional.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "if (cond) {\n  library(cli)\n} else {\n  library(cli)\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["after"]), vec![vec![
+        "cli".to_string()
+    ]]);
+}
+
+#[test]
+fn test_attach_on_both_branches_does_not_reach_earlier_uses_in_either_arm() {
+    // Each arm's attach applies only after its own call. The joined attach begins
+    // at the `else` call, so it does not reach `second`.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source =
+        "if (cond) {\n  first\n  library(cli)\n} else {\n  second\n  library(cli)\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    let no_attach: Vec<String> = Vec::new();
+    assert_eq!(
+        attaches_at(&db, file, source, &["first", "second", "after"]),
+        vec![no_attach.clone(), no_attach, vec!["cli".to_string()]]
+    );
+}
+
+#[test]
+fn test_join_matches_arms_per_package_not_wholesale() {
+    // The consequence attaches an extra package. Matching is per package, so cli
+    // carries past the `if` while rlang stays capped at the arm that attached it.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli", "rlang"]);
+
+    let source =
+        "if (cond) {\n  library(cli)\n  library(rlang)\n  inside\n} else {\n  library(cli)\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside", "after"]), vec![
+        vec!["rlang".to_string(), "cli".to_string()],
+        vec!["cli".to_string()]
+    ]);
+}
+
+#[test]
+fn test_join_caps_a_package_attached_only_by_the_else_arm() {
+    // Mirror of the above with the extra package in the `else`. Being the arm
+    // that closes the `if` doesn't carry rlang past it, since the consequence
+    // never attached it.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli", "rlang"]);
+
+    let source =
+        "if (cond) {\n  library(cli)\n} else {\n  library(cli)\n  library(rlang)\n  inside\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside", "after"]), vec![
+        vec!["rlang".to_string(), "cli".to_string()],
+        vec!["cli".to_string()]
+    ]);
+}
+
+#[test]
+fn test_join_takes_the_else_arm_order_when_the_arms_attach_in_different_orders() {
+    // Both arms attach both packages, so both carry past the `if`, but the arms
+    // disagree on which was attached last. One layer order has to stand for both
+    // paths, and it's the `else` arm's calls that carry the packages out.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli", "rlang"]);
+
+    let source = "if (cond) {\n  library(cli)\n  library(rlang)\n} else {\n  \
+                  library(rlang)\n  library(cli)\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["after"]), vec![vec![
+        "cli".to_string(),
+        "rlang".to_string()
+    ]]);
+}
+
+#[test]
+fn test_attach_rejoined_inside_an_arm_carries_through_the_outer_join() {
+    // The inner `if` rejoins cli onto its own `else` call, which the outer join
+    // then sees as the consequence arm's attach. So the outer `else` carries cli
+    // out, and the inner calls stay capped at the arm they ran in.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "if (a) {\n  if (b) library(cli) else library(cli)\n} else {\n  before\n  \
+                  library(cli)\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["before", "after"]), vec![
+        Vec::<String>::new(),
+        vec!["cli".to_string()]
+    ]);
+}
+
+#[test]
+fn test_attach_on_every_arm_of_an_else_if_chain_holds_after_the_chain() {
+    // An `else if` nests a whole `if` in the alternative, so each join sees the
+    // arm below it already rejoined. The final `else` closes the outer `if` too,
+    // which is what lets its attach carry the chain.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "if (a) {\n  first\n  library(cli)\n} else if (b) {\n  second\n  \
+                  library(cli)\n} else {\n  third\n  library(cli)\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    let no_attach: Vec<String> = Vec::new();
+    assert_eq!(
+        attaches_at(&db, file, source, &["first", "second", "third", "after"]),
+        vec![no_attach.clone(), no_attach.clone(), no_attach, vec![
+            "cli".to_string()
+        ]]
+    );
+}
+
+#[test]
+fn test_attach_on_all_but_one_arm_of_an_else_if_chain_drops_at_the_chain() {
+    // One arm without the attach breaks the chain, so nothing holds afterwards
+    // even though the last arm attaches. Closing the outer `if` isn't on its own
+    // enough to carry an attach past it.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "if (a) {\n  library(cli)\n} else if (b) {\n  middle\n} else {\n  \
+                  library(cli)\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    let no_attach: Vec<String> = Vec::new();
+    assert_eq!(attaches_at(&db, file, source, &["middle", "after"]), vec![
+        no_attach.clone(),
+        no_attach
+    ]);
+}
+
+#[test]
+fn test_attach_in_loop_body_does_not_hold_after_the_loop() {
+    // An empty sequence means the body never runs, so the attach doesn't
+    // survive the loop even though no branch is involved.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "for (i in xs) {\n  library(cli)\n  inside\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside", "after"]), vec![
+        vec!["cli".to_string()],
+        Vec::<String>::new()
+    ]);
+}
+
+#[test]
+fn test_attach_on_both_branches_inside_a_loop_drops_at_the_loop_join() {
+    // Both `if` arms attach `cli`, but a loop body may not run. The attach ends
+    // at the loop's closing brace.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "while (cond) {\n  if (x) library(cli) else library(cli)\n  inside\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside", "after"]), vec![
+        vec!["cli".to_string()],
+        Vec::<String>::new()
+    ]);
+}
+
+#[test]
+fn test_conditional_attach_reaches_only_a_body_defined_in_its_branch() {
+    // A lazy body ignores source order, so it sees a file-scope attach wherever
+    // that attach sits. A conditional one is different: only a body defined
+    // inside the arm is guaranteed to run with the package attached.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source =
+        "if (cond) {\n  library(cli)\n  f <- function() guarded\n}\ng <- function() unguarded\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(
+        attaches_at(&db, file, source, &["guarded", "unguarded"]),
+        vec![vec!["cli".to_string()], Vec::<String>::new()]
+    );
+}
+
+#[test]
+fn test_conditional_attach_inside_a_body_holds_only_in_its_arm() {
+    // The arm narrowing is the same inside a lazy body as at file scope: `taken`
+    // runs with cli attached, `after` only might.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "g <- function() {\n  if (cond) {\n    library(cli)\n    taken\n  }\n  after\n}\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["taken", "after"]), vec![
+        vec!["cli".to_string()],
+        Vec::<String>::new()
+    ]);
+}
+
+#[test]
+fn test_cursor_in_local_narrows_to_calls_that_have_run() {
+    // `local()` runs at its call site, so a cursor inside it sees the search
+    // path as of that point, not the end-of-file view a function body gets.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "local({\n  inside\n})\nlibrary(cli)\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside"]), vec![Vec::<
+        String,
+    >::new(
+    )]);
+}
+
+#[test]
+fn test_attach_in_local_is_visible_after_the_local() {
+    // The block runs during the file's own top-level execution, so its
+    // `library()` is on the search path afterwards, the same as one written
+    // directly at top level.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "local({\n  library(cli)\n})\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["after"]), vec![vec![
+        "cli".to_string()
+    ]]);
+}
+
+#[test]
+fn test_attach_in_function_body_is_not_visible_after_it() {
+    // The body may never run, so its `library()` stays out of the top-level
+    // view. Guards the eager-scope widening against swallowing lazy scopes.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "f <- function() {\n  library(cli)\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["after"]), vec![Vec::<
+        String,
+    >::new(
+    )]);
+}
+
+#[test]
+fn test_attach_in_a_function_body_is_not_visible_in_a_sibling_body() {
+    // `g()` and `h()` can run in either order, so `g()`'s attach does not reach
+    // `h()`.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "g <- function() {\n  library(cli)\n}\nh <- function() {\n  inside\n}\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside"]), vec![Vec::<
+        String,
+    >::new(
+    )]);
+}
+
+#[test]
+fn test_attach_from_a_local_block_reaches_the_rest_of_the_body() {
+    // `local()` runs during `g()`, so its `library()` reaches code after the
+    // block.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "g <- function() {\n  local({ library(cli) })\n  inside\n}\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside"]), vec![vec![
+        "cli".to_string()
+    ]]);
+}
+
+#[test]
+fn test_attach_later_in_an_enclosing_body_is_not_visible_in_a_nested_body() {
+    // `h()` can run before `g()` reaches the later `library()`, so the attach
+    // does not reach `h()`.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "g <- function() {\n  h <- function() inside\n  library(cli)\n}\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside"]), vec![Vec::<
+        String,
+    >::new(
+    )]);
+}
+
+#[test]
+fn test_attach_in_a_function_body_is_visible_in_a_body_it_encloses() {
+    // `outer()` creates `inner` only after the preceding `library()` runs, so
+    // the attach reaches `inner()`.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "outer <- function() {\n  library(cli)\n  inner <- function() inside\n}\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside"]), vec![vec![
+        "cli".to_string()
+    ]]);
+}
+
+#[test]
+fn test_attach_in_a_function_body_is_not_visible_earlier_in_that_body() {
+    // `g()` executes `inside` before its later `library()`, so no attach reaches
+    // `inside`.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "g <- function() {\n  inside\n  library(cli)\n}\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside"]), vec![Vec::<
+        String,
+    >::new(
+    )]);
+}
+
+#[test]
+fn test_attach_is_not_visible_on_the_attaching_call() {
+    // The attach begins after `library()` returns, so offsets in the multiline
+    // call see no attach.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "library(\n  cli\n)\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(
+        attaches_at(&db, file, source, &["library", "cli", "after"]),
+        vec![Vec::<String>::new(), Vec::<String>::new(), vec![
+            "cli".to_string()
+        ]]
+    );
+}
+
+#[test]
+fn test_attach_in_a_function_body_is_visible_later_in_that_body() {
+    // `library()` returns before the later `inside` expression runs in `g()`, so
+    // the attach is visible there.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "g <- function() {\n  library(cli)\n  inside\n}\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    assert_eq!(attaches_at(&db, file, source, &["inside"]), vec![vec![
+        "cli".to_string()
+    ]]);
 }

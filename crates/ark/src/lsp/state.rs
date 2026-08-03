@@ -1,26 +1,34 @@
 use std::collections::HashMap;
 
+use aether_path::AbsPathBuf;
 use aether_path::FilePath;
 use anyhow::anyhow;
 use oak_db::File;
 use oak_db::OakDatabase;
-use oak_semantic::library::Library;
-use url::Url;
+use salsa::Database;
+use tower_lsp_server::ls_types::Uri;
 
 use crate::lsp::config::LspConfig;
-use crate::lsp::inputs::source_root::SourceRoot;
 use crate::lsp::open_file::OpenFile;
+use crate::lsp::traits::url::UrlExt;
 
-#[derive(Clone, Default, Debug)]
+#[derive(Default, Debug)]
 /// The world state, i.e. all the inputs necessary for analysing or refactoring
 /// code. This is a pure value. There is no interior mutability in this data
-/// structure. It can be cloned and safely sent to other threads.
+/// structure.
+///
+/// The main loop owns and mutates this. Background readers get a
+/// [`crate::lsp::analysis::WorldStateSnapshot`] instead, which only lends its
+/// database out as `&dyn ArkDb`, so a background thread can't reach a Salsa
+/// input setter. Snapshots are minted in [`crate::lsp::analysis`] and nowhere
+/// else. This split mirrors rust-analyzer's `GlobalState` and
+/// `GlobalStateSnapshot`.
 pub(crate) struct WorldState {
     /// Salsa input tree for Oak queries.
     pub(crate) db: OakDatabase,
 
     /// Watched documents, keyed on the normalised [`FilePath`] form.
-    /// The verbatim editor URL is preserved on each [`OpenFile::wire_url`]
+    /// The verbatim editor `Uri` is preserved on each [`OpenFile::wire_uri`]
     /// for wire output.
     pub(crate) open_files: HashMap<FilePath, OpenFile>,
 
@@ -57,93 +65,91 @@ pub(crate) struct WorldState {
     /// Currently installed packages
     pub(crate) installed_packages: Vec<String>,
 
-    /// The root of the source tree (e.g., a package).
-    pub(crate) root: Option<SourceRoot>,
-
-    /// Map of package name to package metadata and package sources for installed
-    /// libraries. Lazily populated.
-    pub(crate) library: Library,
-
     pub(crate) config: LspConfig,
 }
 
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Workspace {
-    pub folders: Vec<Url>,
+    pub folders: Vec<AbsPathBuf>,
 }
 
 impl WorldState {
-    pub(crate) fn new(db: OakDatabase, library: Library) -> Self {
+    pub(crate) fn new(db: OakDatabase) -> Self {
         Self {
             db,
-            library,
             ..Default::default()
         }
     }
 
-    pub(crate) fn open_file_mut(&mut self, uri: &Url) -> anyhow::Result<&mut OpenFile> {
-        let key = FilePath::from_url(uri);
-        if let Some(open_file) = self.open_files.get_mut(&key) {
-            Ok(open_file)
-        } else {
-            Err(anyhow!("Can't find document for URI {uri}"))
-        }
+    /// Advance the oak revision without changing any oak input.
+    ///
+    /// Currently used for state that lives on `WorldState` but not in the Oak
+    /// DB (e.g. console scopes and the diagnostics config). The revision bump
+    /// invalidates in-flight background workers (e.g. diagnostics), and
+    /// triggers a diagnostic refresh.
+    pub(crate) fn bump_revision(&mut self) {
+        self.db.synthetic_write(salsa::Durability::LOW);
     }
 
-    /// Snapshot for the diagnostics worker, which runs off the main loop and
-    /// queries oak.
-    pub(crate) fn diagnostics_snapshot(&self) -> WorldState {
-        WorldState {
-            db: self.db.clone(),
-            console_scopes: self.console_scopes.clone(),
-            installed_packages: self.installed_packages.clone(),
-            root: self.root.clone(),
-            library: self.library.clone(),
-            config: self.config.clone(),
-            open_files: HashMap::new(),
-            virtual_documents: HashMap::new(),
-            workspace: Workspace::default(),
-        }
+    pub(crate) fn open_file_mut(&mut self, path: &FilePath) -> anyhow::Result<&mut OpenFile> {
+        self.open_files
+            .get_mut(path)
+            .ok_or_else(|| anyhow!("Can't find document for path {path}"))
     }
 
     /// The stored [`OpenFile`] for a request.
-    pub(crate) fn open_file(&self, uri: &Url) -> anyhow::Result<&OpenFile> {
-        let key = FilePath::from_url(uri);
-        let Some(open_file) = self.open_files.get(&key) else {
-            return Err(anyhow!("Can't find document for URI {uri}"));
-        };
-        Ok(open_file)
-    }
-
-    /// URL to put on the wire for `file`. Open buffers keep the editor's
-    /// verbatim URL so the frontend sees the URI it sent us. Files that were
-    /// never opened in the editor (disk-scanned files, resolution targets) have
-    /// no verbatim URL, so synthesise one from the normalised path.
-    pub(crate) fn wire_url(&self, file: File) -> Url {
-        let path = file.path(&self.db);
+    pub(crate) fn open_file(&self, path: &FilePath) -> anyhow::Result<&OpenFile> {
         self.open_files
             .get(path)
-            .map(|open_file| open_file.wire_url().clone())
-            .unwrap_or_else(|| path.to_url())
+            .ok_or_else(|| anyhow!("Can't find document for path {path}"))
     }
 
-    /// Register an editor buffer in `open_files`, keying on the normalised
-    /// [`FilePath`] and stashing the verbatim editor URL on [`OpenFile::wire_url`] for
-    /// wire output.
+    /// The [`Uri`] to put on the wire for `file`. Open buffers replay the
+    /// editor's verbatim `Uri`, so the frontend gets back exactly the bytes it
+    /// sent us. Files that were never opened in the editor (disk-scanned
+    /// files, resolution targets) have no verbatim `Uri`, so synthesise one
+    /// from the normalised path.
+    ///
+    /// Fails only for a `Virtual` file that was never opened: `Url` tolerates
+    /// characters in a path (`[`, `]`, `|`, `^`) that `Uri` rejects, so
+    /// [`aether_path::VirtualUri`]'s stored `Url` can be one `Uri` can't parse.
+    pub(crate) fn wire_uri(&self, file: File) -> anyhow::Result<Uri> {
+        let path = file.path(&self.db);
+
+        if let Some(open_file) = self.open_files.get(path) {
+            return Ok(open_file.wire_uri().clone());
+        }
+
+        match path {
+            FilePath::File(abs_path) => Uri::from_file_path(abs_path.as_path())
+                .ok_or_else(|| anyhow!("error building a URI for path {abs_path}")),
+            FilePath::Virtual(uri) => uri.as_url().to_uri(),
+        }
+    }
+
+    /// Register an editor buffer in `open_files`, keying on `path` and stashing
+    /// the verbatim editor `uri` on [`OpenFile::wire_uri`] for wire output.
     ///
     /// The caller is in charge of pushing the contents into `oak` via
     /// `upsert_editor()` and handing us the resulting [`File`].
-    pub(crate) fn insert_open_file(&mut self, url: Url, file: File, version: Option<i32>) {
-        let key = FilePath::from_url(&url);
-        let open_file = OpenFile::new(file, version, url);
-        self.open_files.insert(key, open_file);
+    pub(crate) fn insert_open_file(
+        &mut self,
+        uri: Uri,
+        path: FilePath,
+        file: File,
+        version: Option<i32>,
+    ) {
+        let open_file = OpenFile::new(file, version, uri);
+        self.open_files.insert(path, open_file);
     }
 }
 
-pub(crate) fn open_file_wire_urls(state: &WorldState) -> Vec<Url> {
+/// The wire `Uri` of every open buffer, paired with the [`FilePath`] it's keyed
+/// on so a caller can look the buffer back up without converting.
+pub(crate) fn open_file_wire_uris(state: &WorldState) -> Vec<(FilePath, Uri)> {
     state
         .open_files
-        .values()
-        .map(|doc| doc.wire_url().clone())
+        .iter()
+        .map(|(path, open_file)| (path.clone(), open_file.wire_uri().clone()))
         .collect()
 }

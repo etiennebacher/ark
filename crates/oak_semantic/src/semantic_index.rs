@@ -1,6 +1,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use aether_syntax::AnyRExpression;
 use aether_syntax::RBinaryExpression;
 use aether_syntax::RCall;
 use aether_syntax::RForStatement;
@@ -42,7 +43,7 @@ define_index!(EnclosingSnapshotId);
 // that each can be cached and invalidated independently (when salsa is
 // introduced).
 #[derive(Debug)]
-#[cfg_attr(feature = "salsa", derive(salsa::Update))]
+#[cfg_attr(feature = "salsa", derive(salsa::SalsaValue))]
 #[cfg_attr(feature = "testing", derive(PartialEq, Eq))]
 pub struct SemanticIndex {
     scopes: IndexVec<ScopeId, Scope>,
@@ -85,6 +86,10 @@ pub struct SemanticIndex {
     // `package:::symbol`
     namespace_accesses: Vec<NamespaceAccess>,
 
+    // Diagnostics surfaced during indexing, for downstream consumers to turn
+    // into user-facing diagnostics.
+    diagnostics: Vec<SemanticDiagnostic>,
+
     // The file scope's exit flow state: for each top-level symbol, the
     // definitions still in effect once the file has run top to bottom. This is
     // the file's exports (see `exports()`). Only the file scope's exit state is
@@ -102,6 +107,7 @@ impl SemanticIndex {
         enclosing_snapshots: FxHashMap<EnclosingSnapshotKey, (ScopeId, EnclosingSnapshotId)>,
         semantic_calls: Vec<SemanticCall>,
         namespace_accesses: Vec<NamespaceAccess>,
+        diagnostics: Vec<SemanticDiagnostic>,
         final_bindings: IndexVec<SymbolId, Bindings>,
     ) -> Self {
         Self {
@@ -113,6 +119,7 @@ impl SemanticIndex {
             enclosing_snapshots,
             semantic_calls,
             namespace_accesses,
+            diagnostics,
             final_bindings,
         }
     }
@@ -167,15 +174,58 @@ impl SemanticIndex {
         exports
     }
 
-    /// Package names from `library()` / `require()` calls in this file.
+    /// Package names from `library()` / `require()` calls that run at the
+    /// file's own top level.
+    ///
+    /// A `library()` reached only by running a lazy body attaches only if that
+    /// body runs, which may be never, so it does not count here. That covers a
+    /// function body, a lazy NSE argument, and an eager `local()` *nested*
+    /// inside one (see [`Self::scope_is_eager`]). This is the load-time
+    /// search-path view: what another file sees after `source()`-ing this one,
+    /// and what an eager callee resolves against. For every `library()`
+    /// regardless of context, see [`Self::attached_packages_anywhere`].
     pub fn attached_packages(&self) -> Vec<&str> {
         self.semantic_calls
             .iter()
-            .filter_map(|c| match &c.kind {
-                SemanticCallKind::Attach { package } => Some(package.as_str()),
+            .filter(|call| self.scope_is_eager(call.scope))
+            .filter_map(|call| match &call.kind {
+                SemanticCallKind::Attach { package, .. } => Some(package.as_str()),
                 SemanticCallKind::Source { .. } => None,
             })
             .collect()
+    }
+
+    /// Every `library()` / `require()` call in the file, including those in
+    /// function bodies and other lazy contexts.
+    ///
+    /// Over-approximates the load-time search path, since a lazy body may never
+    /// run, so most callers want [`Self::attached_packages`]. Use this only
+    /// where a lazy attach still counts, e.g. "which packages does this file
+    /// depend on" for workspace dependency discovery.
+    pub fn attached_packages_anywhere(&self) -> Vec<&str> {
+        self.semantic_calls
+            .iter()
+            .filter_map(|call| match &call.kind {
+                SemanticCallKind::Attach { package, .. } => Some(package.as_str()),
+                SemanticCallKind::Source { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Whether `scope` runs during the file's own top-level execution, i.e. no
+    /// enclosing scope is lazy.
+    pub fn scope_is_eager(&self, scope_id: ScopeId) -> bool {
+        self.enclosing_lazy_scope(scope_id).is_none()
+    }
+
+    /// The scan unit that controls when code in `scope_id` runs.
+    ///
+    /// Returns `scope_id` when it is lazy, otherwise its nearest lazy ancestor.
+    /// `None` means the code runs while the file loads. An eager `local()` block
+    /// remains in its enclosing lazy scan unit.
+    pub fn enclosing_lazy_scope(&self, scope_id: ScopeId) -> Option<ScopeId> {
+        self.ancestor_scope_ids(scope_id)
+            .find(|&id| self.scope(id).kind.is_lazy())
     }
 
     /// Cross-file call sites (`library()`, `source()`, …) recorded
@@ -188,6 +238,12 @@ impl SemanticIndex {
     /// `package:::symbol`
     pub fn namespace_accesses(&self) -> &[NamespaceAccess] {
         &self.namespace_accesses
+    }
+
+    /// Diagnostics surfaced during indexing, for downstream consumers to turn
+    /// into user-facing diagnostics.
+    pub fn diagnostics(&self) -> &[SemanticDiagnostic] {
+        &self.diagnostics
     }
 
     /// Find the innermost scope containing `offset`.
@@ -323,8 +379,7 @@ impl SemanticIndex {
         let local = bindings.definitions().iter().map(move |&d| (scope_id, d));
 
         let enclosing = if bindings.may_be_unbound() {
-            let symbol_id = self.uses(scope_id)[use_id].symbol();
-            self.enclosing_bindings(scope_id, symbol_id)
+            self.enclosing_bindings(scope_id, use_id)
         } else {
             None
         };
@@ -337,10 +392,10 @@ impl SemanticIndex {
 
     /// Resolve a free variable's bindings from the enclosing scope.
     ///
-    /// When a use in `scope` may be unbound (`may_be_unbound: true`), some
-    /// control-flow paths fall through to an enclosing scope. This looks up
-    /// the enclosing snapshot that was registered during the build and
-    /// returns the ancestor scope and its bindings. This covers both purely
+    /// When the use `use_id` in `scope` may be unbound (`may_be_unbound: true`),
+    /// some control-flow paths fall through to an enclosing scope. This looks up
+    /// the enclosing snapshot that was registered for that use during the build
+    /// and returns the ancestor scope and its bindings. This covers both purely
     /// free variables (no local definitions) and conditionally defined
     /// variables (local definitions exist but don't cover all paths).
     ///
@@ -350,11 +405,11 @@ impl SemanticIndex {
     pub fn enclosing_bindings(
         &self,
         scope: ScopeId,
-        symbol: SymbolId,
+        use_id: UseId,
     ) -> Option<(ScopeId, &Bindings)> {
         let key = EnclosingSnapshotKey {
             nested_scope: scope,
-            nested_symbol: symbol,
+            nested_use: use_id,
         };
         let &(enclosing_scope, snapshot_id) = self.enclosing_snapshots.get(&key)?;
         let bindings = self.use_def_maps[enclosing_scope].enclosing_snapshot(snapshot_id);
@@ -363,18 +418,17 @@ impl SemanticIndex {
 }
 
 /// Key for looking up an enclosing snapshot. Keyed by the nested scope and the
-/// symbol's `SymbolId` in the nested scope's symbol table (not the enclosing
-/// scope's), so consumers can do an O(1) lookup directly from a `UseId` without
-/// re-walking the ancestor chain.
+/// `UseId` of the free variable in that scope, so consumers do an O(1) lookup
+/// straight from a use without re-walking the ancestor chain.
 ///
-/// When we implement NSE, we will add a `laziness: ScopeLaziness` field to
-/// distinguish lazy snapshots (functions, accumulated union via watchers) from
-/// eager snapshots (NSE scopes like `local()`, point-in-time capture at the
-/// call site). Currently all nested scopes are lazy, so the field is omitted.
+/// Keyed per use, not per symbol, because eager snapshots (e.g. `local()`) are
+/// point-in-time: two uses of the same free variable at different points in an
+/// eager body can see different enclosing states, so each gets its own
+/// snapshot. Lazy uses of one symbol still share a single snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EnclosingSnapshotKey {
     pub nested_scope: ScopeId,
-    pub nested_symbol: SymbolId,
+    pub nested_use: UseId,
 }
 
 // --- Scope ---
@@ -384,9 +438,9 @@ pub struct EnclosingSnapshotKey {
 // by the file: walking `parent` from any scope eventually reaches the
 // `File` scope which itself has `parent: None`.
 //
-// Currently only `function()` creates a new scope. In the future, constructs
-// like `local()`, `with()`, `within()` may also create scopes (determined
-// by function declarations resolved via salsa queries).
+// `function()` creates `Function` scopes. NSE constructs like `local()`,
+// `with()`, `test_that()` create `Nse` scopes, recognized by resolving the
+// call target against for their effects annotations during the walk.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Scope {
     pub(crate) parent: Option<ScopeId>,
@@ -405,6 +459,56 @@ pub enum ScopeKind {
     // cross-file resolution (package namespace, session, etc.) takes over.
     File,
     Function,
+    Nse(EvalEnv, EvalTiming),
+}
+
+/// Where definitions in an NSE scope land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalEnv {
+    /// Definitions go to the current (parent) environment.
+    /// e.g. `rlang::on_load()`
+    Current,
+    /// Definitions go to a nested environment.
+    /// e.g. `local()`, `test_that()`, `with()`
+    Nested,
+}
+
+/// Whether an NSE scope evaluates eagerly (at the call site) or lazily
+/// (at an unknown later time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalTiming {
+    /// Expression that runs at the call site. Free variables resolve against
+    /// the linear state right there. E.g. `local()`, `evalq()`, `test_that()`.
+    Eager,
+    /// Expression that runs at an unknown later time, so free variables resolve
+    /// against the accumulated union of enclosing definitions. E.g.
+    /// `shiny::reactive()`, `rlang::on_load()`.
+    Lazy,
+}
+
+impl ScopeKind {
+    /// Whether free variables in this scope resolve against the union of all
+    /// enclosing definitions (lazy) or against a point-in-time snapshot at the
+    /// call site (eager). `Function` bodies run at an unknown later time, so
+    /// they're always lazy.
+    pub fn is_lazy(self) -> bool {
+        match self {
+            ScopeKind::File => false,
+            ScopeKind::Function => true,
+            ScopeKind::Nse(_, timing) => timing == EvalTiming::Lazy,
+        }
+    }
+
+    /// Whether this scope is its own evaluation environment, holding its own
+    /// bindings. `Current` NSE scopes (`evalq()`, `rlang::on_load()`) share
+    /// their bindings with a parent scope. All other scopes are owners.
+    ///
+    /// Orthogonal to [`is_lazy`](Self::is_lazy), which is about timing:
+    /// `shiny::reactive()` owns its bindings and is lazy, `base::local()` owns
+    /// its bindings and is eager.
+    pub fn owns_bindings(self) -> bool {
+        !matches!(self, ScopeKind::Nse(EvalEnv::Current, _))
+    }
 }
 
 impl Scope {
@@ -626,6 +730,16 @@ pub enum DefinitionKind {
         file: Url,
         name: String,
     },
+    /// A binding created by a call (e.g. `assign("x", value)`) or a binding
+    /// operator (`x %<>% f()`) rather than a syntactic `<-`. `node` is the whole
+    /// binding expression (for its range and provenance), `name` the name
+    /// argument or left operand (goto, rename), and `value` the value a type
+    /// checker infers from (`None` when absent).
+    Assign {
+        node: AstPtr<AnyRExpression>,
+        name: AstPtr<AnyRExpression>,
+        value: Option<AstPtr<AnyRExpression>>,
+    },
 }
 
 impl Definition {
@@ -681,15 +795,48 @@ impl Ranged for Use {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticCall {
     pub(crate) kind: SemanticCallKind,
-    pub(crate) offset: TextSize,
+    pub(crate) range: TextRange,
     pub(crate) scope: ScopeId,
+}
+
+/// Where an attach is known to hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachRegion {
+    /// From the call to its scope's end when every path to a later offset has the
+    /// package attached. This includes calls that run on every path and the `else`
+    /// call when both `if` arms attach the package.
+    Unconditional,
+    /// From the call to `end` only, the close of the arm or loop body that
+    /// made it. Nothing outside is known, in either direction.
+    ///
+    /// The start isn't a field: it's always the call's own offset, so
+    /// [`contains`](Self::contains) takes the `call` rather than storing a
+    /// redundant start that could disagree with it.
+    Conditional { end: TextSize },
+}
+
+impl AttachRegion {
+    /// Whether the attach from `call` holds at `offset`.
+    ///
+    /// The package attaches after the call returns, so the region starts at
+    /// `call.range().end()` and excludes every offset in `library(foo)`.
+    pub fn contains(&self, call: &SemanticCall, offset: TextSize) -> bool {
+        call.range().end() <= offset &&
+            match self {
+                AttachRegion::Unconditional => true,
+                AttachRegion::Conditional { end } => offset <= *end,
+            }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticCallKind {
     /// `library(pkg)` or `require(pkg)`: attaches a package to the
     /// search path. Contributes a fallback layer for unbound symbols.
-    Attach { package: String },
+    Attach {
+        package: String,
+        region: AttachRegion,
+    },
     /// `source("path")`: injects the sourced file's top-level
     /// bindings into the current scope. Local-scope semantics, not
     /// search-path semantics.
@@ -706,7 +853,11 @@ impl SemanticCall {
     }
 
     pub fn offset(&self) -> TextSize {
-        self.offset
+        self.range.start()
+    }
+
+    pub fn range(&self) -> TextRange {
+        self.range
     }
 
     pub fn scope(&self) -> ScopeId {
@@ -762,6 +913,59 @@ pub enum NamespaceAccessKind {
     Export,
     /// `:::`
     Internal,
+}
+
+/// A diagnostic surfaced while building the semantic index, for downstream
+/// consumers to turn into user-facing diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticDiagnostic {
+    /// An effect decision (NSE scope or attach) settled on the eager-linear
+    /// reading even though another reading was possible. `call_range` points at
+    /// the call we decided about, which may or may not have come out effectful;
+    /// `reason` says what made it ambiguous and where the competing site is.
+    AmbiguousEffect {
+        name: String,
+        call_range: TextRange,
+        reason: AmbiguityReason,
+    },
+    /// Both `if` arms attach the same packages in different orders. The scanner
+    /// retains the `else` arm's order in `packages`, but R searches the most recent
+    /// attach first, so masked names after the `if` depend on the selected arm.
+    ///
+    /// Emit this even without a current name collision. A later package upgrade
+    /// could introduce one without a source change. The `range` covers the `if`.
+    AmbiguousAttachOrder {
+        packages: Vec<String>,
+        range: TextRange,
+    },
+    /// A `library()`/`require()` attach whose package doesn't resolve. `range`
+    /// points at the attach call.
+    UninstalledPackage { package: String, range: TextRange },
+}
+
+/// Why an [`AmbiguousEffect`](SemanticDiagnostic::AmbiguousEffect) could have
+/// read the other way, and where the competing site is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmbiguityReason {
+    /// The callee is bound by a lazy-crossed ancestor with undetermined
+    /// timing: a later assignment in parent code, or one from another
+    /// deferred body that could run before or after us. `overwrite_range`
+    /// points at that ancestor binding.
+    LazyShadow { overwrite_range: TextRange },
+    /// The callee is shadowed by a *conditional* local binding in the same
+    /// scope (`if (cond) local <- identity; local({...})`). The eager linear
+    /// scan dropped the conditional binding and resolved the effect, so the
+    /// scope shape is condition-dependent. `binding_range` points at the
+    /// conditional binding.
+    ConditionalShadow { binding_range: TextRange },
+    /// The callee would have been effectful, but the `library()`/`require()`
+    /// that annotates it was attached on only some paths and dropped at a
+    /// branch or loop join, so we read the call as plain. `attach_range` points
+    /// at that conditional attach.
+    ConditionalAttach {
+        package: String,
+        attach_range: TextRange,
+    },
 }
 
 // --- Iterators ---
