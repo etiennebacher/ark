@@ -7,7 +7,7 @@ use oak_core::syntax_ext::RIdentifierExt;
 
 use crate::effects::CallContext;
 use crate::effects::EffectHandler;
-use crate::effects::Formal;
+use crate::effects::Formals;
 use crate::effects::ResolvedArgumentEffect;
 use crate::effects::ResolvedArgumentEffects;
 
@@ -22,48 +22,23 @@ impl EffectHandler for BquoteHandler {
     type Output = ResolvedArgumentEffects;
 
     fn resolve(&self, call: &RCall, ctx: &CallContext<'_>) -> Option<ResolvedArgumentEffects> {
-        // `bquote(expr, where, splice)`: only `expr` (the first positional) is
-        // quoted. The other arguments are ordinary values.
-        let formals = [
-            Formal {
-                name: "expr",
-                position: 0,
-            },
-            Formal {
-                name: "splice",
-                position: 2,
-            },
-        ];
-        let matched = ctx.match_arguments(call, &formals);
-
-        let args = call.arguments().ok()?;
-        let values: Vec<Option<AnyRExpression>> = args
-            .items()
-            .iter()
-            .map(|item| item.ok().and_then(|arg| arg.value()))
-            .collect();
+        let formals: Formals = &["expr", "where", "splice"];
+        let bound = ctx.bind_arguments(call, formals);
 
         // `..()` only splices under `splice = TRUE`.
-        let splice = matched
-            .iter()
-            .position(|formal| *formal == Some(1))
-            .and_then(|i| values.get(i))
-            .and_then(|value| value.as_ref())
+        let splice = bound
+            .get("splice")
             .and_then(|value| ctx.resolve_static_bool(value))
             .unwrap_or(false);
 
         Some(
-            matched
-                .into_iter()
-                .enumerate()
-                .map(|(i, formal)| {
-                    // Only `expr` (formal 0) is quoted
-                    if formal != Some(0) {
+            bound
+                .arguments()
+                .map(|(formal, value)| {
+                    if formal != Some("expr") {
                         return None;
                     }
-                    let holes = values
-                        .get(i)
-                        .and_then(|value| value.as_ref())
+                    let holes = value
                         .map(|expr| unquote_holes(expr, splice))
                         .unwrap_or_default();
                     Some(ResolvedArgumentEffect::Quote { holes })

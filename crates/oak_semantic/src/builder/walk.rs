@@ -24,6 +24,7 @@ use biome_rowan::TextSize;
 use biome_rowan::WalkEvent;
 use oak_core::syntax_ext::AnyRSelectorExt;
 use oak_core::syntax_ext::RIdentifierExt;
+use smallvec::SmallVec;
 
 use super::assignment_name;
 use super::is_assignment;
@@ -40,6 +41,7 @@ use crate::resolver::ImportsResolver;
 use crate::semantic_index::AttachRegion;
 use crate::semantic_index::Definition;
 use crate::semantic_index::DefinitionKind;
+use crate::semantic_index::EnclosingSnapshotId;
 use crate::semantic_index::EnclosingSnapshotKey;
 use crate::semantic_index::EvalEnv;
 use crate::semantic_index::EvalTiming;
@@ -504,12 +506,13 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
         // (sequential execution is guaranteed), but inside a function it's
         // only visible within that function and its children, since the
         // function might never be called. Same reasoning as `source()` calls.
-        let call_range = call.syntax().text_trimmed_range();
-        let region = self.attach_region(call_range.start(), &package);
+        let range = call.syntax().text_trimmed_range();
+        let region = self.attach_region(range.start(), &package);
         self.walk.semantic_calls.push(SemanticCall {
             kind: SemanticCallKind::Attach { package, region },
-            range: call_range,
+            range,
             scope: self.current_scope,
+            callee: bare_callee_name(call),
         });
     }
 
@@ -544,6 +547,7 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
     fn walk_source_call(&mut self, call: &aether_syntax::RCall) {
         let range = call.syntax().text_trimmed_range();
         let call_offset = range.start();
+        let callee = bare_callee_name(call);
 
         // Read back what the scan cached: the sourced files, each with its
         // resolution. The scan is the single point that extracts the paths and
@@ -552,6 +556,22 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
             Some(resolution) => resolution.source.clone(),
             None => return,
         };
+
+        // Only a call that runs at load time pins down what the sourced
+        // file's top level can see. One inside a function body might never
+        // run, or might run after the rest of this file, so we record
+        // nothing there and let the sourced file fall back to whole-file
+        // exports.
+        if self.enclosing_lazy_scope(self.current_scope).is_none() {
+            let file_scope = ScopeId::from(0);
+            let symbols = &self.walk.symbol_tables[file_scope];
+            let bound = self.walk.use_def_maps[file_scope]
+                .bound_symbol_ids()
+                .map(|symbol_id| symbols.symbol(symbol_id).name());
+            self.walk
+                .bindings_at_sources
+                .record_source_call(call_offset, bound);
+        }
 
         for SourcedFile { path, resolution } in sourced {
             // Record every sourced file, independent of whether it resolved.
@@ -563,6 +583,7 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
                 kind: SemanticCallKind::Source { path, resolved },
                 range,
                 scope: self.current_scope,
+                callee: callee.clone(),
             });
 
             let Some(resolution) = resolution else {
@@ -601,6 +622,10 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
                     },
                     range,
                     scope: self.current_scope,
+                    // No callee: nothing is written at `range` under this name.
+                    // The `source()` call that forwarded these carries it, so a
+                    // consumer keying on the callee sees the site once.
+                    callee: None,
                 });
             }
         }
@@ -802,16 +827,10 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
 
         self.walk.use_def_maps[owner_scope].ensure_symbol(symbol_id);
 
-        // Deferred: the body executes at an unknown later time, so the
-        // definition shouldn't shadow what's already live. This is the same
-        // mechanism as `<<-`.
-        //
-        // Known imprecision: the deferred def is visible to ALL uses in
-        // the parent scope (with `may_be_unbound: true`), including
-        // file-level uses that run before the lazy body executes. Ideally
-        // these defs would only be reachable from lazy scopes (functions),
-        // not from eager/file-level code.
-        self.walk.use_def_maps[owner_scope].record_deferred_definition(symbol_id, def_id);
+        // `Current + Lazy` handlers run after the owner's eager execution, so
+        // their assignments only reach lazy snapshots and `exports()`, not
+        // eager uses.
+        self.walk.use_def_maps[owner_scope].record_lazy_definition(symbol_id, def_id);
     }
 
     // Super-assignment is lexically in the current scope but binds in an
@@ -838,8 +857,7 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
                 range,
             });
             self.walk.use_def_maps[self.current_scope].ensure_symbol(symbol_id);
-            self.walk.use_def_maps[self.current_scope]
-                .record_deferred_definition(symbol_id, def_id);
+            self.walk.use_def_maps[self.current_scope].record_super_definition(symbol_id, def_id);
             return;
         };
 
@@ -861,8 +879,7 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
             range,
         });
         self.walk.use_def_maps[target_scope].ensure_symbol(target_symbol);
-        self.walk.use_def_maps[target_scope]
-            .record_deferred_definition(target_symbol, target_def_id);
+        self.walk.use_def_maps[target_scope].record_super_definition(target_symbol, target_def_id);
     }
 
     fn add_assign_definitions(&mut self, node: &AnyRExpression, bindings: Vec<AssignBinding>) {
@@ -885,28 +902,12 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
         }
     }
 
-    // Walk up from `start` to the first scope where `name` already has
-    // `IS_BOUND`. Returns that scope, or the file scope if no binding is found
-    // (mirroring R's assignment to the global environment). Reaching the file
-    // scope unbound ends the walk there, so its `parent` of `None` is the
-    // natural terminator.
+    // R's `<<-` targets the first ancestor with an `IS_BOUND` binding. Without
+    // one, it assigns in the global, file scope.
     fn resolve_super_target(&self, name: &str, start: ScopeId) -> ScopeId {
-        let mut scope = start;
-        loop {
-            if let Some(id) = self.walk.symbol_tables[scope].id(name) {
-                if self.walk.symbol_tables[scope]
-                    .symbol(id)
-                    .flags()
-                    .contains(SymbolFlags::IS_BOUND)
-                {
-                    return scope;
-                }
-            }
-            let Some(parent) = self.scopes[scope].parent else {
-                return scope;
-            };
-            scope = parent;
-        }
+        self.ancestor_scope_ids(start)
+            .find(|&scope| self.walked_binding(scope, name).is_some())
+            .unwrap_or(ScopeId::from(0))
     }
 
     fn add_use(&mut self, name: &str, range: TextRange) {
@@ -951,6 +952,12 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
         // track with `all_eager`.
         let mut all_eager = !self.scopes[self.current_scope].kind.is_lazy();
 
+        // Register every binding ancestor. `scope_binds_anywhere()` cannot
+        // distinguish conditional bindings, and lazy ancestors can gain
+        // definitions after this walk. The query applies the stopping rule to
+        // this innermost-first chain once boundness is known.
+        let mut chain: SmallVec<[(ScopeId, EnclosingSnapshotId); 1]> = SmallVec::new();
+
         loop {
             if self.scope_binds_anywhere(current_scope, name) {
                 // Intern with empty flags: we just need a stable `SymbolId` for
@@ -970,29 +977,23 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
                         .register_eager_snapshot(enclosing_symbol_id);
                     (current_scope, snapshot_id)
                 } else {
-                    // Lazy: every use of this symbol resolves to the same
-                    // growing snapshot, so dedup on (nested scope, nested symbol)
-                    // and reuse it across uses.
-                    let dedup_key = (self.current_scope, nested_symbol);
+                    // Lazy uses share a growing snapshot per binding ancestor.
+                    // Key it by `(use scope, nested symbol, ancestor scope)`.
+                    let dedup_key = (self.current_scope, nested_symbol, current_scope);
 
-                    if let Some(&entry) = self.walk.lazy_snapshots.get(&dedup_key) {
-                        entry
-                    } else {
-                        let snapshot_id = self.walk.use_def_maps[current_scope]
-                            .register_lazy_snapshot(enclosing_symbol_id);
-                        let entry = (current_scope, snapshot_id);
-                        self.walk.lazy_snapshots.insert(dedup_key, entry);
-                        entry
-                    }
+                    let snapshot_id =
+                        if let Some(&snapshot_id) = self.walk.lazy_snapshots.get(&dedup_key) {
+                            snapshot_id
+                        } else {
+                            let snapshot_id = self.walk.use_def_maps[current_scope]
+                                .register_lazy_snapshot(enclosing_symbol_id);
+                            self.walk.lazy_snapshots.insert(dedup_key, snapshot_id);
+                            snapshot_id
+                        };
+                    (current_scope, snapshot_id)
                 };
 
-                let use_key = EnclosingSnapshotKey {
-                    nested_scope: self.current_scope,
-                    nested_use: use_id,
-                };
-                self.walk.enclosing_snapshots.insert(use_key, entry);
-
-                return;
+                chain.push(entry);
             }
 
             if self.scopes[current_scope].kind.is_lazy() {
@@ -1000,9 +1001,29 @@ impl<R: ImportsResolver> SemanticIndexBuilder<R> {
             }
 
             let Some(parent) = self.scopes[current_scope].parent else {
-                return;
+                break;
             };
             current_scope = parent;
         }
+
+        // Omit empty chains so no entry continues to signal cross-file resolution.
+        if !chain.is_empty() {
+            let use_key = EnclosingSnapshotKey {
+                nested_scope: self.current_scope,
+                nested_use: use_id,
+            };
+            self.walk.enclosing_snapshots.insert(use_key, chain);
+        }
+    }
+}
+
+/// The callee of `call` when it's written as a bare identifier. `None` for
+/// anything else, including a `pkg::fn` callee: `::` names the package outright,
+/// so no binding can shadow it. Mirrors the two cases
+/// `resolve_effects_handlers` recognizes.
+fn bare_callee_name(call: &RCall) -> Option<String> {
+    match call.function().ok()? {
+        AnyRExpression::RIdentifier(ident) => Some(ident.name_text().to_string()),
+        _ => None,
     }
 }

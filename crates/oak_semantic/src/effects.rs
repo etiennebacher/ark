@@ -51,9 +51,9 @@ pub struct Effects {
     pub arguments: Option<ResolvedArgumentEffects>,
     /// Attach a package
     pub attach: Option<String>,
-    /// Source one or more files. A vector so a collation-style callee can name
+    /// Source one or more paths. A vector so a collation-style callee can name
     /// several; base `source` resolves to one.
-    pub source: Option<Vec<String>>,
+    pub source: Option<Vec<SourcePath>>,
     /// Bind one or more names in the current scope (`assign("x", value)`). A
     /// vector so a multi-binding callee stays expressible; base `assign` and
     /// `delayedAssign` resolve to one.
@@ -80,7 +80,7 @@ pub struct AssignBinding {
 pub struct EffectsHandlers {
     pub arguments: Option<&'static dyn EffectHandler<Output = ResolvedArgumentEffects>>,
     pub attach: Option<&'static dyn EffectHandler<Output = String>>,
-    pub source: Option<&'static dyn EffectHandler<Output = Vec<String>>>,
+    pub source: Option<&'static dyn EffectHandler<Output = Vec<SourcePath>>>,
     pub assign: Option<&'static dyn AssignHandler>,
 }
 
@@ -98,6 +98,31 @@ pub fn lookup(package: &str, function: &str) -> Option<&'static EffectsHandlers>
 /// wins, so recognition skips resolution entirely.
 pub fn annotates(name: &str) -> bool {
     INDEX.contains_key(name)
+}
+
+/// HACK: This matches a `sourceDir()` call syntactically. See `?source` for the
+/// definition of `sourceDir()` that people copy around:
+/// https://github.com/search?q=sourceDir+language%3AR&type=code
+/// This is a stopgap workaround until we can infer source effects around a
+/// `list.files()` loop.
+///
+/// The copied `sourceDir()` idiom leaves `list.files()` at its
+/// `recursive = FALSE` default, so nested scripts are excluded.
+pub fn source_dir_idiom(name: &str) -> Option<&'static EffectsHandlers> {
+    if name != "sourceDir" {
+        return None;
+    }
+    Some(&EffectsHandlers {
+        arguments: None,
+        attach: None,
+        source: Some(&SourceAnnotation {
+            formals: &["path"],
+            path: "path",
+            target: SourceTarget::Dir(DirWalk::Shallow),
+            default_path: None,
+        }),
+        assign: None,
+    })
 }
 
 /// Resolver for an effect of a call.
@@ -200,13 +225,10 @@ impl<'a> CallContext<'a> {
         self.scope.is_none_or(|scope| scope.is_global())
     }
 
-    /// Match `call`'s arguments to `formals`, returning for each call argument
-    /// in order the index into `formals` it bound to. Named arguments match
-    /// first, then the rest fill by position.
-    ///
-    /// A stopgap: without the callee's full formal list, a positional argument
-    /// only binds a formal declared at that exact position.
-    pub fn match_arguments(&self, call: &RCall, formals: &[Formal]) -> Vec<Option<usize>> {
+    /// Match `call` arguments to `formals`, returning a formal index for each
+    /// call argument. Exact named matches consume slots first, then unnamed
+    /// arguments fill unconsumed slots in signature order.
+    fn match_arguments(&self, call: &RCall, formals: Formals) -> Vec<Option<usize>> {
         let Ok(args) = call.arguments() else {
             return Vec::new();
         };
@@ -227,24 +249,42 @@ impl<'a> CallContext<'a> {
 
         // Positional pass. Only unnamed args reach the match, and none of them
         // were set by the named pass, so no need to re-check `matched[i]`.
-        let mut position = 0usize;
+        let mut next_slot = 0usize;
         for (i, item) in items.iter().enumerate() {
-            let Ok(arg) = item else {
-                position += 1;
+            let Ok(arg) = item else { continue };
+            if arg.name_clause().is_some() {
+                continue;
+            }
+            while next_slot < consumed.len() && consumed[next_slot] {
+                next_slot += 1;
+            }
+            let Some(formal_idx) = (next_slot < formals.len()).then_some(next_slot) else {
                 continue;
             };
-            if arg.name_clause().is_some() {
-                position += 1;
-                continue;
-            }
-            if let Some(formal_idx) = match_positional(formals, position, &consumed) {
-                consumed[formal_idx] = true;
-                matched[i] = Some(formal_idx);
-            }
-            position += 1;
+            consumed[formal_idx] = true;
+            matched[i] = Some(formal_idx);
+            next_slot += 1;
         }
 
         matched
+    }
+
+    /// Bind `call`'s arguments to `formals`, for handlers that read arguments by
+    /// formal name rather than by call position.
+    pub fn bind_arguments(&self, call: &RCall, formals: Formals) -> BoundArguments {
+        let matched = self.match_arguments(call, formals);
+        let values: Vec<Option<AnyRExpression>> = match call.arguments() {
+            Ok(args) => args
+                .items()
+                .iter()
+                .map(|item| item.ok().and_then(|arg| arg.value()))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        BoundArguments {
+            formals,
+            bound: matched.into_iter().zip(values).collect(),
+        }
     }
 
     /// Statically evaluate an argument's value expression to a string. `None`
@@ -277,16 +317,44 @@ impl<'a> CallContext<'a> {
     }
 }
 
-/// A formal a handler wants to locate in a call, by name and by its position in
-/// the callee's signature.
-///
-/// TODO(nse): `position` is a stopgap that stems from our annotation registry
-/// listing only its scoped formals. Once `match_arguments` is signature-aware
-/// it gets the callee's full ordered formals, and this collapses to a list of
-/// names where the index is the position.
-pub struct Formal {
-    pub name: &'static str,
-    pub position: usize,
+/// The initial formal names needed to match the arguments this handler reads.
+/// Include every earlier slot so unnamed arguments bind correctly. Stop before
+/// `...`, because later R formals are matched by name rather than position.
+pub type Formals = &'static [&'static str];
+
+/// A call's arguments indexed by the formals they match.
+pub struct BoundArguments {
+    formals: Formals,
+    /// One entry per call argument, in call order: the formal it matched and its
+    /// value expression.
+    bound: Vec<(Option<usize>, Option<AnyRExpression>)>,
+}
+
+impl BoundArguments {
+    /// The expression bound to `formal`. Returns `None` when the call uses the
+    /// default or the handler did not declare the formal.
+    pub fn get(&self, formal: &str) -> Option<&AnyRExpression> {
+        let formal_idx = self.formals.iter().position(|name| *name == formal)?;
+        self.bound
+            .iter()
+            .find(|(matched_idx, _)| *matched_idx == Some(formal_idx))?
+            .1
+            .as_ref()
+    }
+
+    /// Returns each call argument's matched formal and expression in call order.
+    pub fn arguments(&self) -> impl Iterator<Item = (Option<&str>, Option<&AnyRExpression>)> + '_ {
+        self.bound
+            .iter()
+            .map(|(matched_idx, value)| (matched_idx.map(|idx| self.formals[idx]), value.as_ref()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.bound.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bound.is_empty()
+    }
 }
 
 /// A call's resolved argument effects: for each argument in call order, the
@@ -310,14 +378,13 @@ pub enum ResolvedArgumentEffect {
 /// default [`EffectHandler`] for it by matching the declaration to a call.
 #[derive(Debug, Clone, Copy)]
 pub struct ArgumentsAnnotation {
+    pub formals: Formals,
     pub arguments: &'static [Argument],
 }
 
-/// A single annotated argument: its effect, plus where to find it in a call.
 #[derive(Debug)]
 pub struct Argument {
     pub name: &'static str,
-    pub position: usize,
     pub effect: ArgumentEffect,
 }
 
@@ -349,91 +416,88 @@ impl EffectHandler for ArgumentsAnnotation {
     type Output = ResolvedArgumentEffects;
 
     fn resolve(&self, call: &RCall, ctx: &CallContext<'_>) -> Option<ResolvedArgumentEffects> {
-        let arguments = self.arguments;
-        let formals: Vec<Formal> = arguments
-            .iter()
-            .map(|arg| Formal {
-                name: arg.name,
-                position: arg.position,
-            })
-            .collect();
-
-        // The match yields a formal index per call argument
-        let matched = ctx.match_arguments(call, &formals);
+        let bound = ctx.bind_arguments(call, self.formals);
         Some(
-            matched
-                .into_iter()
-                .map(|formal| formal.map(|i| arguments[i].effect.resolve()))
+            bound
+                .arguments()
+                .map(|(formal, _)| {
+                    let formal = formal?;
+                    self.arguments
+                        .iter()
+                        .find(|argument| argument.name == formal)
+                        .map(|argument| argument.effect.resolve())
+                })
                 .collect(),
         )
     }
 }
 
-/// Declares how a source function (`source()`) names the file it reads, and
-/// serves as the default [`EffectHandler`] for it by pulling that path out of a
-/// call.
+/// A path a source call names, and what that path points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePath {
+    pub path: String,
+    pub target: SourceTarget,
+}
+
+/// What a source function's path argument points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceTarget {
+    /// A single file, as base `source()` takes.
+    File,
+    /// R files in a directory. [`DirWalk`] determines whether descendants count.
+    Dir(DirWalk),
+    /// A file or directory. `source()` takes only files, while
+    /// `targets::tar_source()` takes both.
+    FileOrDir(DirWalk),
+}
+
+/// Controls whether directory source targets include descendants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DirWalk {
+    /// Direct children only, matching `list.files()` without `recursive = TRUE`.
+    Shallow,
+    /// Every R file below the directory, matching `list.files(recursive = TRUE)`.
+    Recursive,
+}
+
+/// Declares how a source function (`source()`) names what it reads, and serves
+/// as the default [`EffectHandler`] for it by pulling that path out of a call.
 #[derive(Debug, Clone, Copy)]
 pub struct SourceAnnotation {
-    /// Which positional argument holds the path, counting only unnamed
-    /// arguments (0 for base `source`). Other source-like functions may put the
-    /// path elsewhere, so it's configured per entry rather than assumed.
-    pub position: usize,
+    pub formals: Formals,
+    pub path: &'static str,
+    /// Whether that argument names a file or a directory.
+    pub target: SourceTarget,
+    /// Default path if no argument is suppolied (`tar_source()` defaults to
+    /// `files = "R"`).
+    pub default_path: Option<&'static str>,
 }
 
 impl EffectHandler for SourceAnnotation {
-    type Output = Vec<String>;
+    type Output = Vec<SourcePath>;
 
-    fn resolve(&self, call: &RCall, ctx: &CallContext<'_>) -> Option<Vec<String>> {
-        let args = call.arguments().ok()?;
+    fn resolve(&self, call: &RCall, ctx: &CallContext<'_>) -> Option<Vec<SourcePath>> {
+        let bound = ctx.bind_arguments(call, self.formals);
 
-        // The path is matched positionally among unnamed arguments rather than
-        // through [`CallContext::match_arguments`], for two reasons. We need to
-        // inspect the `local =` value to bail on non-static calls, which
-        // argument matching doesn't do. And counting unnamed arguments is robust
-        // to a named argument coming first (e.g. `source(echo = TRUE, "x.R")`),
-        // which the call-position matching isn't yet. A named `file =` therefore
-        // isn't recognized today.
-        //
-        // TODO(nse): once `match_arguments` is signature-aware (see `Formal`),
-        // the leading-named-arg robustness comes for free and this scan could
-        // fold onto it, keeping only the `local =` bail on top.
-        let mut path: Option<String> = None;
-        let mut positional = 0;
-
-        for item in args.items().iter() {
-            let Ok(arg) = item else { continue };
-
-            if let Some(name_clause) = arg.name_clause() {
-                let Ok(AnyRArgumentName::RIdentifier(name_ident)) = name_clause.name() else {
-                    continue;
-                };
-                if name_ident.name_text() == "local" {
-                    if let Some(value) = arg.value() {
-                        match value {
-                            // TRUE/FALSE are fine, we resolve uniformly. For
-                            // the FALSE in nested context case, we'll emit a
-                            // diagnostic.
-                            AnyRExpression::RTrueExpression(_) |
-                            AnyRExpression::RFalseExpression(_) => {},
-                            // Anything else (environment, non-statically
-                            // resolvable expression) means the call isn't
-                            // statically analyzable, so it's not recognized.
-                            _ => return None,
-                        }
-                    }
-                }
-                continue;
+        if let Some(local) = bound.get("local") {
+            match local {
+                AnyRExpression::RTrueExpression(_) | AnyRExpression::RFalseExpression(_) => {},
+                // Only literal `TRUE` and `FALSE` make the source scope statically
+                // known.
+                _ => return None,
             }
-
-            if positional == self.position {
-                path = arg
-                    .value()
-                    .and_then(|value| ctx.resolve_static_string(&value));
-            }
-            positional += 1;
         }
 
-        path.map(|resolved| vec![resolved])
+        let path = match bound.get(self.path) {
+            // An explicit dynamic path suppresses the default.
+            Some(value) => ctx.resolve_static_string(value)?,
+            None => self.default_path?.to_string(),
+        };
+
+        Some(vec![SourcePath {
+            path,
+            target: self.target,
+        }])
     }
 }
 
@@ -442,9 +506,14 @@ impl EffectHandler for SourceAnnotation {
 /// pulling that name out of a call.
 #[derive(Debug, Clone, Copy)]
 pub struct AssignAnnotation {
-    /// Which positional argument holds the bound name, counting only unnamed
-    /// arguments (0 for base `assign`/`delayedAssign`).
-    pub position: usize,
+    pub formals: Formals,
+    /// Formal holding the bound name.
+    pub name: &'static str,
+    /// Formal holding the bound value.
+    pub value: &'static str,
+    /// Formals that select where the binding lands. `delayedAssign()` takes two
+    /// environments and only `assign.env` is one of these.
+    pub target_env: Formals,
 }
 
 impl AssignHandler for AssignAnnotation {
@@ -452,56 +521,25 @@ impl AssignHandler for AssignAnnotation {
         let EffectSite::Call(call) = site else {
             return None;
         };
-        let args = call.arguments().ok()?;
+        let bound = ctx.bind_arguments(call, self.formals);
 
-        // Matched positionally among unnamed arguments, same as `source`, so a
-        // leading named argument doesn't shift the count and a named `x =` isn't
-        // recognized. The value is the positional right after the name (base
-        // `assign(x, value, ...)`).
-        //
-        // FIXME: A named `value =` isn't captured yet.
-        // TODO(nse): Fold onto `match_arguments()` once it's signature-aware,
-        // same as `source` (see `SourceAnnotation::resolve`), keeping only the
-        // `envir`/`pos` bail and the value-after-name read on top.
-        let mut name: Option<(String, RangedAstPtr<AnyRExpression>)> = None;
-        let mut value_expr: Option<AstPtr<AnyRExpression>> = None;
-        let mut positional = 0;
-
-        for item in args.items().iter() {
-            let Ok(arg) = item else { continue };
-
-            if let Some(name_clause) = arg.name_clause() {
-                let Ok(AnyRArgumentName::RIdentifier(name_ident)) = name_clause.name() else {
-                    continue;
-                };
-
-                // An explicit target environment means the binding lands
-                // somewhere other than the current scope, so it isn't a fact we
-                // can record here. In the future, we could statically recognise
-                // some environment selectors like `parent.frame()`.
-                if matches!(name_ident.name_text().as_str(), "envir" | "pos") {
-                    return None;
-                }
-                continue;
-            }
-
-            if positional == self.position {
-                if let Some(value) = arg.value() {
-                    if let Some(resolved) = ctx.resolve_static_string(&value) {
-                        name = Some((resolved, RangedAstPtr::new(&value)));
-                    }
-                }
-            } else if positional == self.position + 1 {
-                value_expr = arg.value().map(|value| AstPtr::new(&value));
-            }
-            positional += 1;
+        // An explicit target environment binds outside the current scope, which
+        // we don't currently support.
+        if self
+            .target_env
+            .iter()
+            .any(|formal| bound.get(formal).is_some())
+        {
+            return None;
         }
 
-        let (name, name_expr) = name?;
+        let name_expr = bound.get(self.name)?;
+        let name = ctx.resolve_static_string(name_expr)?;
+
         Some(vec![AssignBinding {
             name,
-            name_expr,
-            value_expr,
+            name_expr: RangedAstPtr::new(name_expr),
+            value_expr: bound.get(self.value).map(AstPtr::new),
             target: TargetAccess::Write,
         }])
     }
@@ -537,7 +575,7 @@ impl AssignHandler for BindingOperatorHandler {
 /// formal.
 ///
 /// Should we do partial argument matching? Or rely on partial matching being linted?
-fn match_named(arg: &RArgument, formals: &[Formal], consumed: &[bool]) -> Option<usize> {
+fn match_named(arg: &RArgument, formals: Formals, consumed: &[bool]) -> Option<usize> {
     let clause = arg.name_clause()?;
     let name = clause.name().ok()?;
     let name_text = match &name {
@@ -548,24 +586,6 @@ fn match_named(arg: &RArgument, formals: &[Formal], consumed: &[bool]) -> Option
     formals
         .iter()
         .enumerate()
-        .find(|(i, formal)| !consumed[*i] && formal.name == name_text.as_str())
-        .map(|(i, _)| i)
-}
-
-/// Match an unnamed argument at `position` against `formals`. Returns the index
-/// of the matched formal.
-///
-/// FIXME: This matches positionally on call-site position only: an unnamed
-/// argument at position N matches a formal declared at position N. It doesn't
-/// replicate R's full matching, where named arguments are pulled out first and
-/// the rest fill the remaining formals in order. So `test_that({ ... }, desc =
-/// "d")`, with the block at position 0 but the `code` formal at position 1,
-/// won't match. Good enough without the callee's formal list; revisit if it
-/// misses real cases.
-fn match_positional(formals: &[Formal], position: usize, consumed: &[bool]) -> Option<usize> {
-    formals
-        .iter()
-        .enumerate()
-        .find(|(i, formal)| !consumed[*i] && formal.position == position)
+        .find(|(i, formal_name)| !consumed[*i] && **formal_name == name_text.as_str())
         .map(|(i, _)| i)
 }

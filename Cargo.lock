@@ -477,6 +477,7 @@ dependencies = [
  "strum_macros",
  "tempfile",
  "tokio",
+ "tower",
  "tower-lsp-server",
  "tracing",
  "tracing-appender",

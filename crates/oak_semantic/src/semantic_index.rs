@@ -1,3 +1,4 @@
+use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use oak_core::range::Ranged;
 use oak_index_vec::define_index;
 use oak_index_vec::IndexVec;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use url::Url;
 
 use crate::use_def_map::Bindings;
@@ -74,9 +76,10 @@ pub struct SemanticIndex {
     // during the tree walk. `Arc`-wrapped for fast Salsa comparisons.
     use_def_maps: IndexVec<ScopeId, Arc<UseDefMap>>,
 
-    // For each free variable in a nested scope, maps to the enclosing scope and
-    // snapshot where that symbol is bound.
-    enclosing_snapshots: FxHashMap<EnclosingSnapshotKey, (ScopeId, EnclosingSnapshotId)>,
+    // For each free variable in a nested scope, the chain of ancestor scopes
+    // that bind it, innermost first, each paired with its snapshot.
+    enclosing_snapshots:
+        FxHashMap<EnclosingSnapshotKey, SmallVec<[(ScopeId, EnclosingSnapshotId); 1]>>,
 
     // Cross-file call sites recorded during indexing, such as `library()`
     // attachments or `source()` injections.
@@ -95,6 +98,124 @@ pub struct SemanticIndex {
     // the file's exports (see `exports()`). Only the file scope's exit state is
     // ever needed, so we keep this one copy rather than per-scope state.
     final_bindings: IndexVec<SymbolId, Bindings>,
+
+    bindings_at_sources: Arc<BindingTimeline>,
+
+    // Ranks load-time `source()` calls without storing offsets in import layers.
+    // The map and timeline are built together, so a lookup cannot mix versions.
+    source_ranks: FxHashMap<TextSize, SourceRank>,
+}
+
+/// Zero-based source-order position of a load-time `source()` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SourceRank(u32);
+
+/// Maps each file-scope name to the load-time `source()` calls that can see it.
+///
+/// Use a bitmap rather than a low-water mark because visibility can be
+/// nonmonotone in source order. Restoring the pre-branch flow state before
+/// `else` hides `if`-arm bindings from calls in the `else` arm.
+///
+/// Ranks avoid invalidating the timeline when text above a `source()` call
+/// shifts offsets without changing bindings. Salsa backdates the equal value,
+/// avoiding re-resolution of every transitively sourced file.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct BindingTimeline {
+    visible_at: FxHashMap<String, RankSet>,
+}
+
+/// Stores [`SourceRank`]s as a bitmap. The first 64 ranks remain inline,
+/// avoiding a name set for every load-time `source()` call.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RankSet {
+    words: SmallVec<[u64; 1]>,
+}
+
+impl RankSet {
+    fn insert(&mut self, rank: SourceRank) {
+        let (word, bit) = rank.position();
+        if self.words.len() <= word {
+            self.words.resize(word + 1, 0);
+        }
+        self.words[word] |= 1 << bit;
+    }
+
+    fn contains(&self, rank: SourceRank) -> bool {
+        let (word, bit) = rank.position();
+        self.words
+            .get(word)
+            .is_some_and(|word| word & (1 << bit) != 0)
+    }
+}
+
+impl SourceRank {
+    fn position(self) -> (usize, u32) {
+        (self.0 as usize / 64, self.0 % 64)
+    }
+}
+
+/// Builds a [`BindingTimeline`] and maps source offsets to timeline ranks.
+#[derive(Debug, Default)]
+pub(crate) struct BindingTimelineBuilder {
+    timeline: BindingTimeline,
+    ranks: FxHashMap<TextSize, SourceRank>,
+}
+
+impl BindingTimelineBuilder {
+    pub(crate) fn record_source_call<'a>(
+        &mut self,
+        offset: TextSize,
+        bound: impl Iterator<Item = &'a str>,
+    ) {
+        let rank = SourceRank(self.ranks.len() as u32);
+        self.ranks.insert(offset, rank);
+
+        for name in bound {
+            match self.timeline.visible_at.get_mut(name) {
+                Some(ranks) => ranks.insert(rank),
+                None => {
+                    let mut ranks = RankSet::default();
+                    ranks.insert(rank);
+                    self.timeline.visible_at.insert(name.to_owned(), ranks);
+                },
+            }
+        }
+    }
+
+    pub(crate) fn finish(self) -> (BindingTimeline, FxHashMap<TextSize, SourceRank>) {
+        (self.timeline, self.ranks)
+    }
+}
+
+/// File-scope names visible at one or more load-time `source()` calls.
+///
+/// Import layers retain the shared timeline and source-call ranks instead of
+/// copying visible names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportsAtSource {
+    timeline: Arc<BindingTimeline>,
+    ranks: SmallVec<[SourceRank; 1]>,
+}
+
+impl ExportsAtSource {
+    pub fn contains(&self, name: &str) -> bool {
+        self.timeline
+            .visible_at
+            .get(name)
+            .is_some_and(|visible| self.sees(visible))
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.timeline
+            .visible_at
+            .iter()
+            .filter(|(_, visible)| self.sees(visible))
+            .map(|(name, _)| name.as_str())
+    }
+
+    fn sees(&self, visible: &RankSet) -> bool {
+        self.ranks.iter().any(|&rank| visible.contains(rank))
+    }
 }
 
 impl SemanticIndex {
@@ -104,12 +225,18 @@ impl SemanticIndex {
         definitions: IndexVec<ScopeId, IndexVec<DefinitionId, Definition>>,
         uses: IndexVec<ScopeId, IndexVec<UseId, Use>>,
         use_def_maps: IndexVec<ScopeId, Arc<UseDefMap>>,
-        enclosing_snapshots: FxHashMap<EnclosingSnapshotKey, (ScopeId, EnclosingSnapshotId)>,
+        enclosing_snapshots: FxHashMap<
+            EnclosingSnapshotKey,
+            SmallVec<[(ScopeId, EnclosingSnapshotId); 1]>,
+        >,
         semantic_calls: Vec<SemanticCall>,
         namespace_accesses: Vec<NamespaceAccess>,
         diagnostics: Vec<SemanticDiagnostic>,
         final_bindings: IndexVec<SymbolId, Bindings>,
+        bindings_at_sources: BindingTimelineBuilder,
     ) -> Self {
+        let (timeline, source_ranks) = bindings_at_sources.finish();
+
         Self {
             scopes,
             symbol_tables,
@@ -121,7 +248,17 @@ impl SemanticIndex {
             namespace_accesses,
             diagnostics,
             final_bindings,
+            bindings_at_sources: Arc::new(timeline),
+            source_ranks,
         }
+    }
+
+    /// Attach a diagnostic the builder couldn't have known about, for the
+    /// caller that drove the build. [`crate::NoopImportsResolver`] users report
+    /// why they fell back this way.
+    pub fn with_diagnostic(mut self, diagnostic: SemanticDiagnostic) -> Self {
+        self.diagnostics.push(diagnostic);
+        self
     }
 
     pub fn scope(&self, id: ScopeId) -> &Scope {
@@ -174,6 +311,23 @@ impl SemanticIndex {
         exports
     }
 
+    /// Returns file-scope definitions bound to `name` without building
+    /// [`Self::exports()`].
+    pub fn export(&self, name: &str) -> impl Iterator<Item = (DefinitionId, &Definition)> {
+        let file_scope = ScopeId::from(0);
+        let defs = &self.definitions[file_scope];
+
+        self.symbol_tables[file_scope]
+            .id(name)
+            // A use can intern a name without creating an entry in
+            // `final_bindings`.
+            .and_then(|symbol_id| self.final_bindings.get(symbol_id))
+            .map(Bindings::definitions)
+            .unwrap_or_default()
+            .iter()
+            .map(move |&def_id| (def_id, &defs[def_id]))
+    }
+
     /// Package names from `library()` / `require()` calls that run at the
     /// file's own top level.
     ///
@@ -213,7 +367,8 @@ impl SemanticIndex {
     }
 
     /// Whether `scope` runs during the file's own top-level execution, i.e. no
-    /// enclosing scope is lazy.
+    /// enclosing scope is lazy. Wider than "is the file scope", since a
+    /// `local()` or `test_that()` body runs at its call site.
     pub fn scope_is_eager(&self, scope_id: ScopeId) -> bool {
         self.enclosing_lazy_scope(scope_id).is_none()
     }
@@ -244,6 +399,28 @@ impl SemanticIndex {
     /// into user-facing diagnostics.
     pub fn diagnostics(&self) -> &[SemanticDiagnostic] {
         &self.diagnostics
+    }
+
+    /// Returns file-scope names visible at any load-time `source()` call in
+    /// `offsets`.
+    ///
+    /// Returns `None` if `offsets` is empty or an offset is not a load-time
+    /// `source()` call. Lazy calls can run after the file has finished, so their
+    /// view is not fixed.
+    pub fn exports_at_sources(&self, offsets: &[TextSize]) -> Option<ExportsAtSource> {
+        if offsets.is_empty() {
+            return None;
+        }
+
+        let ranks: Option<SmallVec<[SourceRank; 1]>> = offsets
+            .iter()
+            .map(|offset| self.source_ranks.get(offset).copied())
+            .collect();
+
+        Some(ExportsAtSource {
+            timeline: Arc::clone(&self.bindings_at_sources),
+            ranks: ranks?,
+        })
     }
 
     /// Find the innermost scope containing `offset`.
@@ -362,64 +539,101 @@ impl SemanticIndex {
 
     /// All definitions that could reach the use at `(scope, use_id)`.
     ///
-    /// The local use-def bindings always count. The enclosing-scope snapshot
-    /// also counts when `may_be_unbound` is true. That happens when the local
-    /// binding doesn't cover every control-flow path, so execution can fall
-    /// through to the outer scope.
-    ///
-    /// When `may_be_unbound` is false we deliberately skip the enclosing scope.
-    /// Otherwise a shadowed inner use would also bind to the outer def of the
-    /// same name.
+    /// Local use-def bindings always count. If they may be unbound, add
+    /// ancestor snapshots innermost first and stop at the first definitely
+    /// bound ancestor, which shadows all outer scopes.
     pub fn reaching_definitions(
         &self,
         scope_id: ScopeId,
         use_id: UseId,
     ) -> impl Iterator<Item = (ScopeId, DefinitionId)> + '_ {
-        let bindings = self.use_def_map(scope_id).bindings_at_use(use_id);
-        let local = bindings.definitions().iter().map(move |&d| (scope_id, d));
-
-        let enclosing = if bindings.may_be_unbound() {
-            self.enclosing_bindings(scope_id, use_id)
-        } else {
-            None
-        };
-        let enclosing_iter = enclosing.into_iter().flat_map(|(scope, bindings)| {
-            bindings.definitions().iter().map(move |&def| (scope, def))
-        });
-
-        local.chain(enclosing_iter)
+        self.reaching_bindings(scope_id, use_id)
+            .flat_map(|(scope, bindings)| {
+                bindings.definitions().iter().map(move |&def| (scope, def))
+            })
     }
 
-    /// Resolve a free variable's bindings from the enclosing scope.
+    /// Whether every path reaching the use at `use_id` is bound by something in
+    /// this index. A `source()`-forwarded `Import` also counts because
+    /// resolution continues through the sourced file's exports, not the search
+    /// path. When false, some path falls outside this index, so the caller has
+    /// to consult other files (collation siblings, attached packages) to finish
+    /// resolving, even if [`Self::reaching_definitions`] already yielded
+    /// candidates.
     ///
-    /// When the use `use_id` in `scope` may be unbound (`may_be_unbound: true`),
-    /// some control-flow paths fall through to an enclosing scope. This looks up
-    /// the enclosing snapshot that was registered for that use during the build
-    /// and returns the ancestor scope and its bindings. This covers both purely
-    /// free variables (no local definitions) and conditionally defined
-    /// variables (local definitions exist but don't cover all paths).
+    /// Conditional locals and `<<-` writes can produce candidates while still
+    /// leaving some paths unbound. An eager use never sees a lazy handler write
+    /// such as `on.exit(x <- 1)`, so resolution continues outside this index.
+    /// A definitely-bound enclosing scope prevents cross-file resolution even
+    /// when nearer scopes bind only conditionally.
+    pub fn use_is_bound(&self, scope: ScopeId, use_id: UseId) -> bool {
+        self.reaching_bindings(scope, use_id)
+            .any(|(_, bindings)| !bindings.may_be_unbound())
+    }
+
+    /// Yields bindings for the use at `(scope, use_id)`, from the local scope
+    /// outward while each closer scope may be unbound. Stops after the first
+    /// definitely-bound scope, which shadows every outer scope.
+    fn reaching_bindings(
+        &self,
+        scope: ScopeId,
+        use_id: UseId,
+    ) -> impl Iterator<Item = (ScopeId, &Bindings)> {
+        let local = self.use_def_map(scope).bindings_at_use(use_id);
+        let mut may_fall_through = local.may_be_unbound();
+        let mut chain = self.enclosing_bindings_chain(scope, use_id);
+
+        iter::once((scope, local)).chain(iter::from_fn(move || {
+            if !may_fall_through {
+                return None;
+            }
+            let (ancestor_scope, bindings) = chain.next()?;
+            may_fall_through = bindings.may_be_unbound();
+            Some((ancestor_scope, bindings))
+        }))
+    }
+
+    /// Returns the nearest enclosing binding snapshot for a use whose local
+    /// bindings may be unbound.
     ///
-    /// Returns `None` if no enclosing snapshot was registered (e.g. the
-    /// variable is truly global or from the search path) and needs
-    /// cross-file resolution.
+    /// [`Self::reaching_definitions`] and [`Self::use_is_bound`] consult all
+    /// binding ancestors. Returns `None` when no lexical ancestor binds the
+    /// name, so resolution must continue across files.
     pub fn enclosing_bindings(
         &self,
         scope: ScopeId,
         use_id: UseId,
     ) -> Option<(ScopeId, &Bindings)> {
+        self.enclosing_bindings_chain(scope, use_id).next()
+    }
+
+    /// Binding ancestor snapshots for a use, innermost first.
+    fn enclosing_bindings_chain(
+        &self,
+        scope: ScopeId,
+        use_id: UseId,
+    ) -> impl Iterator<Item = (ScopeId, &Bindings)> {
         let key = EnclosingSnapshotKey {
             nested_scope: scope,
             nested_use: use_id,
         };
-        let &(enclosing_scope, snapshot_id) = self.enclosing_snapshots.get(&key)?;
-        let bindings = self.use_def_maps[enclosing_scope].enclosing_snapshot(snapshot_id);
-        Some((enclosing_scope, bindings))
+        self.enclosing_snapshots
+            .get(&key)
+            .into_iter()
+            .flat_map(|chain| {
+                chain.iter().map(|&(ancestor_scope, snapshot_id)| {
+                    let bindings =
+                        self.use_def_maps[ancestor_scope].enclosing_snapshot(snapshot_id);
+                    (ancestor_scope, bindings)
+                })
+            })
     }
 }
 
 /// Key for looking up an enclosing snapshot. Keyed by the nested scope and the
 /// `UseId` of the free variable in that scope, so consumers do an O(1) lookup
-/// straight from a use without re-walking the ancestor chain.
+/// straight from a use without re-walking the ancestor chain. The lookup
+/// yields the chain of binding ancestors, innermost first.
 ///
 /// Keyed per use, not per symbol, because eager snapshots (e.g. `local()`) are
 /// point-in-time: two uses of the same free variable at different points in an
@@ -797,6 +1011,7 @@ pub struct SemanticCall {
     pub(crate) kind: SemanticCallKind,
     pub(crate) range: TextRange,
     pub(crate) scope: ScopeId,
+    pub(crate) callee: Option<String>,
 }
 
 /// Where an attach is known to hold.
@@ -852,12 +1067,20 @@ impl SemanticCall {
         &self.kind
     }
 
+    /// The whole call's trimmed range, for diagnostics that want to point at it.
+    pub fn range(&self) -> TextRange {
+        self.range
+    }
+
+    /// Where the call starts, which is what flow ordering compares.
     pub fn offset(&self) -> TextSize {
         self.range.start()
     }
 
-    pub fn range(&self) -> TextRange {
-        self.range
+    /// The callee as written, when it was a bare identifier. `None` for a
+    /// qualified callee like `base::source()`, which no binding can shadow.
+    pub fn callee(&self) -> Option<&str> {
+        self.callee.as_deref()
     }
 
     pub fn scope(&self) -> ScopeId {
@@ -941,6 +1164,13 @@ pub enum SemanticDiagnostic {
     /// A `library()`/`require()` attach whose package doesn't resolve. `range`
     /// points at the attach call.
     UninstalledPackage { package: String, range: TextRange },
+
+    /// This file takes part in a cycle of `source()` calls, so it was indexed
+    /// with [`NoopImportsResolver`](crate::NoopImportsResolver) and sees nothing
+    /// from the files it sources. Carries no range: under that resolver a bare
+    /// `source()` isn't recognized as effectful, so there's no recorded call to
+    /// point at.
+    SourceCycle,
 }
 
 /// Why an [`AmbiguousEffect`](SemanticDiagnostic::AmbiguousEffect) could have
@@ -1002,5 +1232,39 @@ impl<'a> Iterator for AncestorScopeIdsIter<'a> {
         let id = self.current?;
         self.current = self.index.scopes[id].parent;
         Some(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(exports: &ExportsAtSource) -> Vec<&str> {
+        let mut names: Vec<&str> = exports.names().collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_a_call_sees_only_the_names_recorded_against_it() {
+        let mut builder = BindingTimelineBuilder::default();
+        builder.record_source_call(TextSize::from(10), ["a"].into_iter());
+        builder.record_source_call(TextSize::from(20), ["a", "b"].into_iter());
+        let (timeline, ranks) = builder.finish();
+        let timeline = Arc::new(timeline);
+
+        let early = ExportsAtSource {
+            timeline: Arc::clone(&timeline),
+            ranks: [ranks[&TextSize::from(10)]].into_iter().collect(),
+        };
+        let late = ExportsAtSource {
+            timeline,
+            ranks: [ranks[&TextSize::from(20)]].into_iter().collect(),
+        };
+
+        assert_eq!(names(&early), vec!["a"]);
+        assert_eq!(names(&late), vec!["a", "b"]);
+        assert!(!early.contains("b"));
+        assert!(late.contains("b"));
     }
 }

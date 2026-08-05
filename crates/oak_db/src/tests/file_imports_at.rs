@@ -103,10 +103,35 @@ fn package_files(layers: &[ImportLayer]) -> Vec<File> {
     layers
         .iter()
         .filter_map(|layer| match layer {
-            ImportLayer::File(f) => Some(*f),
+            ImportLayer::File(file) | ImportLayer::SourcingFile { file, .. } => Some(*file),
             _ => None,
         })
         .collect()
+}
+
+/// Layer identities, sorted and deduped, for comparing two views that cover the
+/// same layers in different orders.
+fn layer_keys(db: &TestDb, layers: &[ImportLayer]) -> Vec<String> {
+    let mut keys: Vec<String> = layers.iter().map(|layer| layer_key(db, layer)).collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn layer_key(db: &TestDb, layer: &ImportLayer) -> String {
+    match layer {
+        ImportLayer::File(file) => format!("File({})", file.path(db)),
+        ImportLayer::SourcingFile {
+            file,
+            exports_so_far,
+        } => {
+            let mut names: Vec<&str> = exports_so_far.names().collect();
+            names.sort();
+            format!("SourcingFile({}, {names:?})", file.path(db))
+        },
+        ImportLayer::Package(package) => format!("Package({})", package.name(db)),
+        ImportLayer::From(package) => format!("From({})", package.name(db)),
+    }
 }
 
 #[test]
@@ -293,6 +318,82 @@ fn test_testthat_top_level_library_narrows_by_offset() {
 
     let after = test_file.imports_at(&db, TextSize::from(source.len() as u32));
     assert!(library_attaches(&db, &after).contains(&"cli".to_string()));
+}
+
+#[test]
+fn test_edit_above_a_source_call_backdates_the_eager_inherited_view() {
+    // An offset-only edit leaves `mid.R`'s inherited layers equal, so Salsa
+    // backdates them without re-resolving `leaf.R`.
+    let mut db = TestDb::new();
+    let root = workspace_root(&db, "w");
+    let main = make_file(&mut db, "w/main.R", "a_val <- 1\nsource(\"mid.R\")\n");
+    let mid = make_file(&mut db, "w/mid.R", "source(\"leaf.R\")\n");
+    let leaf = make_file(&mut db, "w/leaf.R", "use <- a_val\n");
+    root.set_scripts(&mut db).to(vec![main, mid, leaf]);
+    db.workspace_roots().set_roots(&mut db).to(vec![root]);
+
+    let at_use = TextSize::from(7);
+    let before = layer_keys(&db, &leaf.imports_at(&db, at_use));
+    let executions = db.executions("File::inherited_layers");
+
+    main.set_source_text_override(&mut db).to(Some(
+        "# a comment\na_val <- 1\nsource(\"mid.R\")\n".to_string(),
+    ));
+
+    assert_eq!(layer_keys(&db, &leaf.imports_at(&db, at_use)), before);
+
+    assert_eq!(db.executions("File::inherited_layers"), executions + 1);
+}
+
+/// Creates a `tests/testthat/` fixture with three support files and one test.
+/// Returns `(helper_a, helper_b, setup_c, test_x)`.
+fn testthat_support_workspace(db: &mut TestDb, helper_b: &str) -> (File, File, File, File) {
+    let pkg = install_workspace_package(db, "pkg");
+    let path = |name: &str| format!("workspace/pkg/tests/testthat/{name}");
+
+    let helper_a = make_package_file(db, &path("helper-a.R"), "a_val <- 1\n", pkg);
+    let helper_b = make_package_file(db, &path("helper-b.R"), helper_b, pkg);
+    let setup_c = make_package_file(db, &path("setup-c.R"), "c_val <- 3\n", pkg);
+    let test_x = make_package_file(db, &path("test-x.R"), "x <- 1\n", pkg);
+
+    pkg.set_scripts(db)
+        .to(vec![helper_a, helper_b, setup_c, test_x]);
+    (helper_a, helper_b, setup_c, test_x)
+}
+
+#[test]
+fn test_testthat_support_file_top_level_sees_only_earlier_support_files() {
+    // testthat sources support files in lexical order. `helper-b.R` runs before
+    // `setup-c.R`, so its top-level code cannot see that file.
+    let mut db = TestDb::new();
+    let (helper_a, helper_b, _setup_c, _test_x) =
+        testthat_support_workspace(&mut db, "b_val <- 2\n");
+
+    let layers = helper_b.imports_at(&db, TextSize::from(0));
+    assert_eq!(package_files(&layers), vec![helper_a]);
+}
+
+#[test]
+fn test_testthat_support_file_body_sees_every_support_file() {
+    // The function body runs after every support file is sourced. LIFO lookup
+    // therefore puts `setup-c.R` before `helper-a.R`.
+    let mut db = TestDb::new();
+    let source = "f <- function() {\n  inside\n}\n";
+    let (helper_a, helper_b, setup_c, _test_x) = testthat_support_workspace(&mut db, source);
+
+    let offset = TextSize::from(source.find("inside").unwrap() as u32);
+    let layers = helper_b.imports_at(&db, offset);
+    assert_eq!(package_files(&layers), vec![setup_c, helper_a]);
+}
+
+#[test]
+fn test_testthat_test_file_top_level_sees_every_support_file() {
+    // `test-x.R` runs after every support file, so its eager view retains all of them.
+    let mut db = TestDb::new();
+    let (helper_a, helper_b, setup_c, test_x) = testthat_support_workspace(&mut db, "b_val <- 2\n");
+
+    let layers = test_x.imports_at(&db, TextSize::from(0));
+    assert_eq!(package_files(&layers), vec![setup_c, helper_b, helper_a]);
 }
 
 #[test]
@@ -734,4 +835,188 @@ fn test_attach_in_a_function_body_is_visible_later_in_that_body() {
     assert_eq!(attaches_at(&db, file, source, &["inside"]), vec![vec![
         "cli".to_string()
     ]]);
+}
+
+#[test]
+fn test_script_r_directory_top_level_sees_only_alphabetic_predecessor() {
+    let mut db = TestDb::new();
+    let root = workspace_root(&db, "ws");
+    let a = make_file(&mut db, "ws/R/a.R", "a_val <- 1\n");
+    let b_source = "x <- 1\n";
+    let b = make_file(&mut db, "ws/R/b.R", b_source);
+    root.set_scripts(&mut db).to(vec![a, b]);
+    db.workspace_roots().set_roots(&mut db).to(vec![root]);
+
+    // `b.R` is alphabetically after `a.R`, so `a.R` is its collation
+    // predecessor.
+    let offset = TextSize::from(b_source.find('x').unwrap() as u32);
+    assert_eq!(package_files(&b.imports_at(&db, offset)), vec![a]);
+
+    // `a.R` has no predecessor: it's first in collation order.
+    let offset = TextSize::from(0);
+    assert_eq!(
+        package_files(&a.imports_at(&db, offset)),
+        Vec::<File>::new()
+    );
+}
+
+#[test]
+fn test_script_r_directory_collation_is_case_insensitive() {
+    // Non-package `R/` files use `list.files()` collation, so `a.R` precedes
+    // `Z.R` in a UTF-8 session locale. Package installation's `LC_COLLATE=C`
+    // reverses them.
+    let mut db = TestDb::new();
+    let root = workspace_root(&db, "ws");
+    let z_source = "z_val <- 1\n";
+    let z_file = make_file(&mut db, "ws/R/Z.R", z_source);
+    let a_file = make_file(&mut db, "ws/R/a.R", "a_val <- 1\n");
+    root.set_scripts(&mut db).to(vec![z_file, a_file]);
+    db.workspace_roots().set_roots(&mut db).to(vec![root]);
+
+    let offset = TextSize::from(z_source.len() as u32);
+    assert_eq!(package_files(&z_file.imports_at(&db, offset)), vec![a_file]);
+}
+
+#[test]
+fn test_script_r_directory_unplaced_file_still_sees_only_predecessors() {
+    // A file the editor opened before the scanner placed it sits in
+    // `OrphanRoot`, so it's missing from its own `collation_siblings`. Its
+    // collation position comes from its basename anyway, so the top-level view
+    // stays the strict predecessor prefix instead of widening to every sibling.
+    let mut db = TestDb::new();
+    let root = workspace_root(&db, "ws");
+    let a = make_file(&mut db, "ws/R/a.R", "a_val <- 1\n");
+    let b_source = "x <- 1\n";
+    let b = make_file(&mut db, "ws/R/b.R", b_source);
+    let c = make_file(&mut db, "ws/R/c.R", "c_val <- 3\n");
+
+    // `b.R` is left out: unscanned, so it isn't a collation sibling of anyone.
+    root.set_scripts(&mut db).to(vec![a, c]);
+    db.workspace_roots().set_roots(&mut db).to(vec![root]);
+
+    let offset = TextSize::from(b_source.find('x').unwrap() as u32);
+    assert_eq!(package_files(&b.imports_at(&db, offset)), vec![a]);
+}
+
+#[test]
+fn test_inherited_attach_is_offset_sensitive_via_source_call_position() {
+    // `main.R`'s `library(dplyr)` runs after its `source()` call, so a
+    // top-level cursor in `helpers.R` (Eager: attaches up to the source-call
+    // offset) doesn't see it, while a cursor in a function body (Lazy:
+    // end-of-file view) does.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["dplyr"]);
+    let root = workspace_root(&db, "w");
+
+    let main_source = "source(\"helpers.R\")\nlibrary(dplyr)\n";
+    let main = make_file(&mut db, "w/main.R", main_source);
+
+    let helpers_source = "top <- 1\nf <- function() {\n  body_stmt\n}\n";
+    let helpers = make_file(&mut db, "w/helpers.R", helpers_source);
+
+    root.set_scripts(&mut db).to(vec![main, helpers]);
+    db.workspace_roots().set_roots(&mut db).to(vec![root]);
+
+    let top_offset = TextSize::from(helpers_source.find("top").unwrap() as u32);
+    let top_layers = helpers.imports_at(&db, top_offset);
+    assert!(!library_attaches(&db, &top_layers).contains(&"dplyr".to_string()));
+
+    let body_offset = TextSize::from(helpers_source.find("body_stmt").unwrap() as u32);
+    let body_layers = helpers.imports_at(&db, body_offset);
+    assert!(library_attaches(&db, &body_layers).contains(&"dplyr".to_string()));
+}
+
+#[test]
+fn test_attach_in_eager_scope_is_visible_to_later_top_level_code() {
+    // `library()` attaches to the global search path whatever frame it runs in,
+    // so a call inside `local()` counts for code after the block exactly like a
+    // top-level one would. It's invisible before the block, though, same
+    // narrowing as any other attach.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "before\nlocal({\n  library(cli)\n})\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    let before = TextSize::from(source.find("before").unwrap() as u32);
+    assert!(!library_attaches(&db, &file.imports_at(&db, before)).contains(&"cli".to_string()));
+
+    let after = TextSize::from(source.find("after").unwrap() as u32);
+    assert!(library_attaches(&db, &file.imports_at(&db, after)).contains(&"cli".to_string()));
+}
+
+#[test]
+fn test_imports_at_covers_the_same_layers_as_the_per_sourcing_file_view() {
+    // Both views narrow to `offset` by the same rule and cover the same layers,
+    // grouped differently. `imports_at` is band-major, every sourcing file's
+    // `above` band, then own attaches, then every sourcing file's `below` band.
+    // The per-sourcing-file view is context-major, one file's `above` / own /
+    // `below` in full before the next file's. So the comparison below is over
+    // layer sets, not order.
+    //
+    // Nothing in production reads `imports_at` today (`resolve_at` moved to the
+    // per-sourcing-file view, completions will want the flat one), so this pins
+    // the two together against drift in the narrowing.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["base", "dplyr", "rlang"]);
+    let root = workspace_root(&db, "w");
+
+    // `a.R` attaches a package and `b.R` doesn't, so the two contexts differ
+    // and band-major genuinely reorders against context-major. `helpers.R`'s
+    // own attach sits after the cursor, so an own-attach view that stopped
+    // narrowing would show up as an extra `rlang` layer on one side.
+    let a = make_file(&mut db, "w/a.R", "library(dplyr)\nsource(\"helpers.R\")\n");
+    let b = make_file(&mut db, "w/b.R", "foo <- 1\nsource(\"helpers.R\")\n");
+    let helpers = make_file(&mut db, "w/helpers.R", "foo\nlibrary(rlang)\n");
+    root.set_scripts(&mut db).to(vec![a, b, helpers]);
+    db.workspace_roots().set_roots(&mut db).to(vec![root]);
+
+    let offset = TextSize::from(0);
+    // `helpers.R`'s own standalone context, then one per sourcing file.
+    let contexts = helpers.imports_by_sourcing_file_at(&db, offset);
+    assert_eq!(contexts.len(), 3);
+
+    let flat = helpers.imports_at(&db, offset);
+    let grouped: Vec<ImportLayer> = contexts.into_iter().flatten().collect();
+    assert_eq!(layer_keys(&db, &flat), layer_keys(&db, &grouped));
+}
+
+#[test]
+fn test_attach_under_a_lazy_ancestor_stays_invisible() {
+    // The `local()` here is eager, but it sits in a function body, and nothing
+    // says that function was ever called. So the whole chain out to the file
+    // scope has to be eager, not just the attach's own scope.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["cli"]);
+
+    let source = "f <- function() {\n  local({\n    library(cli)\n  })\n}\nafter\n";
+    let file = make_file(&mut db, "a.R", source);
+
+    let after = TextSize::from(source.find("after").unwrap() as u32);
+    assert!(!library_attaches(&db, &file.imports_at(&db, after)).contains(&"cli".to_string()));
+}
+
+#[test]
+fn test_inherited_attaches_rank_by_source_position_across_source_calls() {
+    // `pkgb` is visible only at the first `source()` call, but it attached after
+    // `pkga`. The merged contexts must preserve that precedence.
+    let mut db = TestDb::new();
+    install_packages(&mut db, &["pkga", "pkgb"]);
+    let root = workspace_root(&db, "w");
+
+    let main = make_file(
+        &mut db,
+        "w/main.R",
+        "library(pkga)\nif (dev) {\n  library(pkgb)\n  source(\"helpers.R\")\n}\nsource(\"helpers.R\")\n",
+    );
+    let helpers_source = "top <- 1\n";
+    let helpers = make_file(&mut db, "w/helpers.R", helpers_source);
+
+    root.set_scripts(&mut db).to(vec![main, helpers]);
+    db.workspace_roots().set_roots(&mut db).to(vec![root]);
+
+    let offset = TextSize::from(helpers_source.find("top").unwrap() as u32);
+    let attaches = library_attaches(&db, &helpers.imports_at(&db, offset));
+
+    assert_eq!(attaches, vec!["pkgb".to_string(), "pkga".to_string()]);
 }

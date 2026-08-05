@@ -1,4 +1,5 @@
 use biome_rowan::TextRange;
+use biome_rowan::TextSize;
 use oak_semantic::semantic_index::AmbiguityReason;
 use oak_semantic::semantic_index::SemanticDiagnostic;
 
@@ -57,6 +58,8 @@ pub enum DiagnosticKind {
     AmbiguousEffect,
     AmbiguousAttachOrder,
     UninstalledPackage,
+    SourceCycle,
+    InheritedShadow,
 }
 
 impl DiagnosticKind {
@@ -66,6 +69,8 @@ impl DiagnosticKind {
             DiagnosticKind::AmbiguousEffect => "ambiguous-effect",
             DiagnosticKind::AmbiguousAttachOrder => "ambiguous-attach-order",
             DiagnosticKind::UninstalledPackage => "uninstalled-package",
+            DiagnosticKind::SourceCycle => "source-cycle",
+            DiagnosticKind::InheritedShadow => "inherited-shadow",
         }
     }
 
@@ -74,6 +79,8 @@ impl DiagnosticKind {
             DiagnosticKind::AmbiguousEffect => Severity::Info,
             DiagnosticKind::AmbiguousAttachOrder => Severity::Info,
             DiagnosticKind::UninstalledPackage => Severity::Warning,
+            DiagnosticKind::SourceCycle => Severity::Warning,
+            DiagnosticKind::InheritedShadow => Severity::Info,
         }
     }
 
@@ -82,6 +89,8 @@ impl DiagnosticKind {
             DiagnosticKind::AmbiguousEffect => true,
             DiagnosticKind::AmbiguousAttachOrder => true,
             DiagnosticKind::UninstalledPackage => true,
+            DiagnosticKind::SourceCycle => true,
+            DiagnosticKind::InheritedShadow => true,
         }
     }
 }
@@ -108,6 +117,7 @@ pub(crate) fn lower_semantic_diagnostic(diagnostic: &SemanticDiagnostic) -> Diag
         SemanticDiagnostic::UninstalledPackage { package, range } => {
             lower_uninstalled_package(package, *range)
         },
+        SemanticDiagnostic::SourceCycle => lower_source_cycle(),
     }
 }
 
@@ -121,7 +131,7 @@ fn lower_ambiguous_effect(
     let (message, annotation) = match reason {
         AmbiguityReason::LazyShadow { overwrite_range } => (
             format!(
-                "Ambiguous reading of effectful `{name}()`. An assignment to `{name}` in an enclosing \
+                "Ambiguous reading of effectful `{name}()`.\nAn assignment to `{name}` in an enclosing \
                  scope could run before this call and change its effect."
             ),
             Annotation {
@@ -131,7 +141,7 @@ fn lower_ambiguous_effect(
         ),
         AmbiguityReason::ConditionalShadow { binding_range } => (
             format!(
-                "Ambiguous reading of effectful `{name}()`. A conditional assignment could shadow `{name}` \
+                "Ambiguous reading of effectful `{name}()`.\nA conditional assignment could shadow `{name}` \
                  on some paths and change its effect."
             ),
             Annotation {
@@ -144,7 +154,7 @@ fn lower_ambiguous_effect(
             attach_range,
         } => (
             format!(
-                "Ambiguous reading of `{name}()`. The package `{package}` is conditionally attached and does not import `{name}` \
+                "Ambiguous reading of `{name}()`.\nThe package `{package}` is conditionally attached and does not import `{name}` \
                  across all paths."
             ),
             Annotation {
@@ -163,7 +173,7 @@ fn lower_ambiguous_effect(
 /// competing site to annotate.
 fn lower_ambiguous_attach_order(packages: &[String], range: TextRange) -> Diagnostic {
     let message = format!(
-        "Ambiguous attach order. The branches attach {packages} in different orders, so which \
+        "Ambiguous attach order.\nThe branches attach {packages} in different orders, so which \
          package masks the other depends on the branch taken.",
         packages = packages
             .iter()
@@ -183,8 +193,21 @@ fn lower_ambiguous_attach_order(packages: &[String], range: TextRange) -> Diagno
 fn lower_uninstalled_package(package: &str, range: TextRange) -> Diagnostic {
     Diagnostic::new(
         DiagnosticKind::UninstalledPackage,
-        format!("Package `{package}` is not installed. Language analysis will be incomplete."),
+        format!("Package `{package}` is not installed.\nLanguage analysis will be incomplete."),
         range,
+        Vec::new(),
+    )
+}
+
+/// Anchored at the start of the file because the record carries no range.
+/// Every file in the cycle gets its own diagnostic.
+fn lower_source_cycle() -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticKind::SourceCycle,
+        "This file takes part in a cycle of mutual `source()` calls.\n\
+         Language analysis will be incomplete until the cycle is resolved."
+            .to_string(),
+        TextRange::empty(TextSize::from(0)),
         Vec::new(),
     )
 }

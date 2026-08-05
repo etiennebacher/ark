@@ -3,7 +3,9 @@ use aether_parser::RParserOptions;
 use biome_rowan::AstNode;
 use oak_semantic::build_index;
 use oak_semantic::effects;
+use oak_semantic::effects::DirWalk;
 use oak_semantic::effects::SourceAnnotation;
+use oak_semantic::effects::SourceTarget;
 use oak_semantic::semantic_index::AmbiguityReason;
 use oak_semantic::semantic_index::AttachRegion;
 use oak_semantic::semantic_index::DefinitionId;
@@ -87,6 +89,24 @@ impl ImportsResolver for MapResolver {
     }
 }
 
+/// Expands any directory to `files`, standing in for the workspace listing.
+/// Needs no `resolve_effects`: `sourceDir` is matched on its name.
+struct DirResolver {
+    files: Vec<SourceResolution>,
+}
+
+impl ImportsResolver for DirResolver {
+    fn resolve_source(&mut self, _path: &str) -> Option<SourceResolution> {
+        None
+    }
+
+    fn resolve_source_dir(&mut self, _path: &str, walk: DirWalk) -> Vec<SourceResolution> {
+        // `sourceDir()` leaves `list.files()` at its `recursive = FALSE` default.
+        assert_eq!(walk, DirWalk::Shallow);
+        self.files.clone()
+    }
+}
+
 /// Resolves `source` to the multi-file [`CollationHandler`] and maps the
 /// collated paths through `sources`.
 struct MultiFileResolver {
@@ -111,11 +131,15 @@ impl ImportsResolver for MultiFileResolver {
     }
 }
 
-/// Resolves `source` to a [`SourceAnnotation`] whose path sits at the second
-/// positional slot, exercising the configurable `position`.
+/// Provides a `source()` annotation whose `file` path formal is second.
 struct PositionResolver;
 
-static SOURCE_AT_POSITION_1: SourceAnnotation = SourceAnnotation { position: 1 };
+static SOURCE_PATH_SECOND: SourceAnnotation = SourceAnnotation {
+    formals: &["ignored", "file"],
+    path: "file",
+    target: SourceTarget::File,
+    default_path: None,
+};
 
 impl ImportsResolver for PositionResolver {
     fn resolve_source(&mut self, _path: &str) -> Option<SourceResolution> {
@@ -127,7 +151,7 @@ impl ImportsResolver for PositionResolver {
             return Some(EffectsHandlers {
                 arguments: None,
                 attach: None,
-                source: Some(&SOURCE_AT_POSITION_1),
+                source: Some(&SOURCE_PATH_SECOND),
                 assign: None,
             });
         }
@@ -824,6 +848,71 @@ fn test_assign_without_value_has_no_value_handle() {
     ));
 }
 
+#[test]
+fn test_assign_named_arguments_record_definition() {
+    let index = index_with_base("assign(value = 1, x = \"foo\")\nfoo");
+    let file = ScopeId::from(0);
+
+    assert!(matches!(
+        only_assign_def(&index),
+        Some(DefinitionKind::Assign { .. })
+    ));
+
+    let map = index.use_def_map(file);
+    let bindings = map.bindings_at_use(UseId::from(1));
+    assert_eq!(bindings.definitions().len(), 1);
+    let def = &index.definitions(file)[bindings.definitions()[0]];
+    assert!(matches!(def.kind(), DefinitionKind::Assign { .. }));
+}
+
+#[test]
+fn test_assign_named_value_handle_points_at_value_expression() {
+    let parsed = parse(
+        "assign(value = 1 + 2, x = \"x\")",
+        RParserOptions::default(),
+    );
+    assert!(!parsed.has_error());
+    let root = parsed.tree().syntax().clone();
+    let index = build_index(&parsed.tree(), TestImportsResolver::with_base());
+
+    let kind = only_assign_def(&index).expect("assign def");
+    let DefinitionKind::Assign {
+        value: Some(value), ..
+    } = kind
+    else {
+        panic!("expected a value handle");
+    };
+    assert_eq!(
+        value.to_node(&root).syntax().text_trimmed().to_string(),
+        "1 + 2"
+    );
+}
+
+#[test]
+fn test_assign_positional_envir_not_recorded() {
+    // `pos` and `envir` move the binding out of the current scope whether they
+    // arrive named or positionally.
+    let index = index_with_base("assign(\"x\", 1, 1, e)");
+    assert!(only_assign_def(&index).is_none());
+}
+
+#[test]
+fn test_delayed_assign_eval_env_recorded() {
+    // `eval.env` says where the promise's expression runs, so the binding still
+    // lands here. Only `assign.env` moves it.
+    let index = index_with_base("delayedAssign(\"x\", expensive(), eval.env = e)");
+    assert!(matches!(
+        only_assign_def(&index),
+        Some(DefinitionKind::Assign { .. })
+    ));
+}
+
+#[test]
+fn test_delayed_assign_explicit_assign_env_not_recorded() {
+    let index = index_with_base("delayedAssign(\"x\", expensive(), assign.env = e)");
+    assert!(only_assign_def(&index).is_none());
+}
+
 // --- source() semantic calls: bail paths ---
 //
 // Cases where the builder can't extract a statically-resolvable
@@ -1242,9 +1331,88 @@ fn test_source_resolver_multiple_files_each_emitted_and_injected() {
 }
 
 #[test]
-fn test_source_resolver_honors_configured_path_position() {
-    // A `SourceAnnotation` with `position: 1` takes the path from the second
-    // positional argument, not the first.
+fn test_source_dir_expands_to_one_call_per_file() {
+    // A `SourceTarget::Dir` path routes to `resolve_source_dir` and expands to
+    // one `Source` call per file, in the order the resolver lists them, each
+    // followed by its own forwarded packages. Every call keeps the directory
+    // path as written, since no per-file path appears in the source text.
+    let files = vec![
+        SourceResolution {
+            url: Url::parse("file:///R/a.R").unwrap(),
+            names: vec!["a_name".into()],
+            packages: vec!["pkgA".into()],
+        },
+        SourceResolution {
+            url: Url::parse("file:///R/b.R").unwrap(),
+            names: vec!["b_name".into()],
+            packages: vec![],
+        },
+    ];
+    let code = "sourceDir(\"R\")\na_name\nb_name\n";
+    let index = build_test_index(code, DirResolver { files });
+
+    assert_eq!(semantic_call_kinds(&index), [
+        &SemanticCallKind::Source {
+            path: "R".into(),
+            resolved: Some(Url::parse("file:///R/a.R").unwrap()),
+        },
+        &SemanticCallKind::Attach {
+            package: "pkgA".into(),
+            region: AttachRegion::Unconditional,
+        },
+        &SemanticCallKind::Source {
+            path: "R".into(),
+            resolved: Some(Url::parse("file:///R/b.R").unwrap()),
+        },
+    ]);
+
+    // Both files' names are injected and resolve at their uses.
+    // Uses: sourceDir(0), a_name(1), b_name(2)
+    let file = ScopeId::from(0);
+    let map = index.use_def_map(file);
+    for use_index in [1, 2] {
+        let bindings = map.bindings_at_use(UseId::from(use_index));
+        assert_eq!(bindings.definitions().len(), 1);
+        let def = &index.definitions(file)[bindings.definitions()[0]];
+        assert!(matches!(def.kind(), DefinitionKind::Import { .. }));
+    }
+}
+
+#[test]
+fn test_source_dir_recognized_despite_a_local_definition() {
+    // `sourceDir` is the worked example in `?source`, so the caller has pasted
+    // the definition into their own file. Ordinary resolution reads that as a
+    // shadowing local binding and drops the effect, which is why the name is
+    // matched syntactically.
+    let files = vec![SourceResolution {
+        url: Url::parse("file:///R/a.R").unwrap(),
+        names: vec!["a_name".into()],
+        packages: vec![],
+    }];
+    let code = "sourceDir <- function(path) NULL\nsourceDir(\"R\")\na_name\n";
+    let index = build_test_index(code, DirResolver { files });
+
+    assert_eq!(semantic_call_kinds(&index), [&SemanticCallKind::Source {
+        path: "R".into(),
+        resolved: Some(Url::parse("file:///R/a.R").unwrap()),
+    }]);
+}
+
+#[test]
+fn test_source_dir_with_no_files_records_the_path_unresolved() {
+    // A directory the resolver expands to nothing still records the path the
+    // user wrote, so a consumer can report it. Same shape as a file path that
+    // didn't resolve.
+    let index = build_test_index("sourceDir(\"R\")\n", DirResolver { files: vec![] });
+
+    assert_eq!(semantic_call_kinds(&index), [&SemanticCallKind::Source {
+        path: "R".into(),
+        resolved: None,
+    }]);
+}
+
+#[test]
+fn test_source_resolver_finds_path_formal_not_first() {
     let index = build_test_index("source(\"ignored\", \"real.R\")", PositionResolver);
     assert_eq!(semantic_call_kinds(&index), [&SemanticCallKind::Source {
         path: "real.R".into(),
@@ -2138,10 +2306,8 @@ f <- function() {
 
 #[test]
 fn test_nse_eager_snapshot_excludes_unrelated_routed_definition() {
-    // `on_load` is `Current + Lazy`, so its `x <- 2` routes to the file scope
-    // as a deferred def recorded after `local()`. The eager snapshot takes no
-    // watcher, so the routed def is excluded, correct since it can't reach the
-    // already-run body.
+    // An eager `local()` snapshot excludes `on_load()` assignments because
+    // namespace loading follows the already-completed body.
     let index = index_with_base(
         "\
 x <- 1
@@ -2156,7 +2322,31 @@ rlang::on_load({
     let file = ScopeId::from(0);
     let local_scope = ScopeId::from(1);
 
-    // Only `x <- 1` (DefinitionId 0). The routed `x <- 2` is excluded.
+    let (enclosing_scope, bindings) = index
+        .enclosing_bindings(local_scope, UseId::from(0))
+        .unwrap();
+    assert_eq!(enclosing_scope, file);
+    assert_eq!(bindings.definitions(), &[DefinitionId::from(0)]);
+}
+
+#[test]
+fn test_nse_eager_snapshot_after_on_load_excludes_routed_definition() {
+    // Source order does not make an `on_load()` assignment visible to an eager
+    // `local()` snapshot, because namespace loading follows file execution.
+    let index = index_with_base(
+        "\
+x <- 1
+rlang::on_load({
+    x <- 2
+})
+local({
+    x
+})
+",
+    );
+    let file = ScopeId::from(0);
+    let local_scope = ScopeId::from(2);
+
     let (enclosing_scope, bindings) = index
         .enclosing_bindings(local_scope, UseId::from(0))
         .unwrap();
@@ -2952,4 +3142,85 @@ f <- function() {
         DefinitionId::from(0),
         DefinitionId::from(1)
     ]);
+}
+
+#[test]
+fn test_nse_on_exit_write_invisible_to_eager_read() {
+    // Eager reads cannot see `on.exit()` assignments, which run only at frame exit.
+    let index = index_with_base(
+        "\
+f <- function() {
+    on.exit(x <- 1)
+    x
+}
+",
+    );
+    let f_scope = ScopeId::from(1);
+
+    let bindings = index.use_def_map(f_scope).bindings_at_use(UseId::from(0));
+    assert!(bindings.definitions().is_empty());
+    assert!(bindings.may_be_unbound());
+
+    assert!(index.enclosing_bindings(f_scope, UseId::from(0)).is_none());
+}
+
+#[test]
+fn test_nse_on_exit_write_invisible_to_earlier_eager_read() {
+    // `on.exit()` assignments do not retroactively reach earlier eager reads.
+    let index = index_with_base(
+        "\
+f <- function() {
+    x
+    on.exit(x <- 1)
+}
+",
+    );
+    let f_scope = ScopeId::from(1);
+
+    let bindings = index.use_def_map(f_scope).bindings_at_use(UseId::from(0));
+    assert!(bindings.definitions().is_empty());
+    assert!(bindings.may_be_unbound());
+    assert!(index.enclosing_bindings(f_scope, UseId::from(0)).is_none());
+}
+
+#[test]
+fn test_nse_on_exit_write_reaches_sibling_handler() {
+    // Later handlers use lazy snapshots, so they include earlier `on.exit()` assignments.
+    let index = index_with_base(
+        "\
+f <- function() {
+    on.exit(x <- 1)
+    on.exit(x, add = TRUE)
+}
+",
+    );
+    let f_scope = ScopeId::from(1);
+    let second_handler_scope = ScopeId::from(3);
+
+    let (enclosing_scope, bindings) = index
+        .enclosing_bindings(second_handler_scope, UseId::from(0))
+        .unwrap();
+    assert_eq!(enclosing_scope, f_scope);
+    assert_eq!(bindings.definitions(), &[DefinitionId::from(0)]);
+}
+
+#[test]
+fn test_nse_on_exit_write_reaches_closure() {
+    // Closure snapshots include `on.exit()` assignments, but execution can precede frame exit.
+    let index = index_with_base(
+        "\
+f <- function() {
+    on.exit(x <- 1)
+    g <- function() x
+    g
+}
+",
+    );
+    let f_scope = ScopeId::from(1);
+    let g_scope = ScopeId::from(3);
+
+    let (enclosing_scope, bindings) = index.enclosing_bindings(g_scope, UseId::from(0)).unwrap();
+    assert_eq!(enclosing_scope, f_scope);
+    assert_eq!(bindings.definitions(), &[DefinitionId::from(0)]);
+    assert!(bindings.may_be_unbound());
 }

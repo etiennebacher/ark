@@ -1,10 +1,8 @@
-use aether_syntax::AnyRExpression;
 use aether_syntax::RCall;
-use biome_rowan::AstSeparatedList;
 
 use crate::effects::CallContext;
 use crate::effects::EffectHandler;
-use crate::effects::Formal;
+use crate::effects::Formals;
 
 /// Handler for `library()` and `require()`. Names the attached package from the
 /// first argument, read as quoted (the symbol or string as written, so
@@ -19,38 +17,12 @@ impl EffectHandler for LibraryHandler {
     type Output = String;
 
     fn resolve(&self, call: &RCall, ctx: &CallContext<'_>) -> Option<String> {
-        // `character.only` sits at signature position 4 in both callees; in
-        // practice it's passed by name.
-        let formals = [
-            Formal {
-                name: "package",
-                position: 0,
-            },
-            Formal {
-                name: "character.only",
-                position: 4,
-            },
-        ];
-        let matched = ctx.match_arguments(call, &formals);
+        let formals: Formals = &["package", "help", "pos", "lib.loc", "character.only"];
+        let bound = ctx.bind_arguments(call, formals);
 
-        let args = call.arguments().ok()?;
-        let values: Vec<Option<AnyRExpression>> = args
-            .items()
-            .iter()
-            .map(|item| item.ok().and_then(|arg| arg.value()))
-            .collect();
-
-        let package = matched
-            .iter()
-            .position(|formal| *formal == Some(0))
-            .and_then(|i| values.get(i))
-            .and_then(|value| value.as_ref())?;
-
-        let character_only = matched
-            .iter()
-            .position(|formal| *formal == Some(1))
-            .and_then(|i| values.get(i))
-            .and_then(|value| value.as_ref())
+        let package = bound.get("package")?;
+        let character_only = bound
+            .get("character.only")
             .and_then(|value| ctx.resolve_static_bool(value))
             .unwrap_or(false);
 
