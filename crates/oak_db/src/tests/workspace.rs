@@ -54,7 +54,7 @@ fn workspace_with_script(db: &mut TestDb, contents: &str) {
 
 /// Create a `proj` workspace root with editor overrides for `scripts`.
 /// Paths are relative to `proj`.
-fn workspace_with_scripts(db: &mut TestDb, scripts: &[(&str, &str)]) {
+fn workspace_with_scripts(db: &mut TestDb, scripts: &[(&str, &str)]) -> Vec<File> {
     let root = workspace_root(&*db, "proj");
     let files: Vec<File> = scripts
         .iter()
@@ -68,8 +68,9 @@ fn workspace_with_scripts(db: &mut TestDb, scripts: &[(&str, &str)]) {
             )
         })
         .collect();
-    root.set_scripts(db).to(files);
+    root.set_scripts(db).to(files.clone());
     db.workspace_roots().set_roots(db).to(vec![root]);
+    files
 }
 
 fn all_package_dependencies_names(db: &TestDb) -> Vec<String> {
@@ -323,4 +324,37 @@ fn test_testthat_file_depends_on_testthat() {
     db.workspace_roots().set_roots(&mut db).to(vec![root]);
 
     assert_eq!(all_package_dependencies_names(&db), vec!["testthat"]);
+}
+
+#[test]
+fn test_source_call_between_loose_r_scripts_collects_every_attach() {
+    // Layout from https://github.com/posit-dev/positron/issues/15631. A loose
+    // `R/` script is standalone, so building `c.R`'s index never reaches `a.R`
+    // or `b.R` and no attach is lost to cycle recovery.
+    let mut db = TestDb::new();
+    register_library(&mut db, &["pkga", "pkgb", "pkgc"]);
+    let files = workspace_with_scripts(&mut db, &[
+        ("R/a.R", "library(pkga)\nsource(\"R/b.R\")\n"),
+        ("R/b.R", "library(pkgb)\n"),
+        ("R/c.R", "library(pkgc)\n"),
+    ]);
+
+    let _ = files[2].used_packages(&db);
+
+    assert_eq!(all_package_dependencies_names(&db), vec![
+        "pkga", "pkgb", "pkgc"
+    ]);
+}
+
+#[test]
+fn test_single_r_file_does_not_panic() {
+    // Smoke test for https://github.com/posit-dev/positron/issues/15631#issuecomment-5437414045
+    // We couldn't reproduce the reported panic but we keep that test as baseline.
+    let mut db = TestDb::new();
+    let files = workspace_with_scripts(&mut db, &[("R/test.R", "x <- 1\n")]);
+
+    let _ = all_package_dependencies_names(&db);
+    let _ = files[0].used_packages(&db);
+    let _ = files[0].imports(&db);
+    let _ = files[0].diagnostics(&db);
 }

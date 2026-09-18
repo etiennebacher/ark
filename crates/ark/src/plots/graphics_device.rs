@@ -187,11 +187,10 @@ pub(crate) struct DeviceContext {
     /// provides the file attribution even though the execute_request came from the console.
     source_context_stack: RefCell<Vec<String>>,
 
-    /// The plot origin captured eagerly when drawing starts (i.e. when `has_changes`
-    /// transitions from false to true). This is necessary because the source context
-    /// stack may be popped before `process_changes()` runs (e.g. `source()` completes
-    /// before the execute request finishes), so we snapshot the origin at drawing time.
-    pending_origin: RefCell<Option<Option<PlotOrigin>>>,
+    /// Snapshot the origin at draw time because `source()` can pop its context
+    /// before `process_changes()` runs. The snapshot is tagged with `PlotId` so a
+    /// stale origin can't be attributed to a later page.
+    pending_origin: RefCell<Option<(PlotId, Option<PlotOrigin>)>>,
 }
 
 impl std::fmt::Debug for DeviceContext {
@@ -269,16 +268,15 @@ impl DeviceContext {
         self.source_context_stack.borrow().last().cloned()
     }
 
-    /// Eagerly capture the plot origin so it's available when `process_changes()` runs later.
-    /// Called when drawing first starts for a change set, since the source context stack
-    /// may be popped before we get a chance to consume it.
     fn set_pending_origin(&self, origin: Option<PlotOrigin>) {
-        self.pending_origin.replace(Some(origin));
+        self.pending_origin.replace(Some((self.id(), origin)));
     }
 
-    /// Clear any unconsumed pending origin.
-    pub(crate) fn clear_pending_origin(&self) {
-        self.pending_origin.replace(None);
+    fn has_pending_origin(&self) -> bool {
+        match self.pending_origin.borrow().as_ref() {
+            Some((page, _)) => *page == self.id(),
+            None => false,
+        }
     }
 
     /// Create a new id for this new plot page (from Positron's perspective)
@@ -286,7 +284,6 @@ impl DeviceContext {
     fn new_positron_page(&self) {
         self.is_new_page.replace(true);
         self.id.replace(Self::new_id());
-        self.clear_pending_origin();
     }
 
     /// Deactivation hook
@@ -338,10 +335,8 @@ impl DeviceContext {
         let old_has_changes = self.has_changes.get();
         self.has_changes.replace(old_has_changes || is_drawing);
 
-        // Eagerly capture the plot origin when drawing first starts for this
-        // change set. The source context stack may be popped before
-        // `process_changes()` runs, so we snapshot it now while it's available.
-        if !old_has_changes && is_drawing {
+        // Capture each page's origin before `source()` pops its context
+        if is_drawing && !self.has_pending_origin() {
             let ctx = self.capture_execution_context();
             let origin = self.capture_plot_origin(&ctx);
             self.set_pending_origin(origin);
@@ -403,13 +398,16 @@ impl DeviceContext {
             .map(Self::code_location_to_origin)
     }
 
-    /// Take the pending origin that was captured eagerly at drawing time.
-    /// Falls back to capturing the origin now if none was pending.
-    fn take_pending_origin(&self, ctx: &ExecutionContext) -> Option<PlotOrigin> {
-        self.pending_origin
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| self.capture_plot_origin(ctx))
+    /// Take the origin captured at drawing time for this page. Falls back to
+    /// capturing the origin now if the snapshot is missing or belongs to an
+    /// earlier page.
+    fn take_pending_origin(&self, id: &PlotId, ctx: &ExecutionContext) -> Option<PlotOrigin> {
+        let pending = self.pending_origin.borrow_mut().take();
+
+        match pending {
+            Some((page, origin)) if page == *id => origin,
+            _ => self.capture_plot_origin(ctx),
+        }
     }
 
     /// Detect the kind of plot from the recording.
@@ -481,6 +479,7 @@ impl DeviceContext {
             PlotBackendRequest::Render(plot_meta) => {
                 log::trace!("PlotBackendRequest::Render");
 
+                let mut pixel_ratio = plot_meta.pixel_ratio;
                 let size = match plot_meta.size {
                     Some(size) => size,
                     None => {
@@ -491,7 +490,12 @@ impl DeviceContext {
                             .get(id)
                             .and_then(|ctx| ctx.intrinsic_size.clone());
                         match intrinsic {
-                            Some(intrinsic) => intrinsic.to_plot_size(),
+                            Some(intrinsic) => {
+                                // Lift the resolution of physical (inch-based)
+                                // sizes so they stay crisp when scaled to fit.
+                                pixel_ratio = pixel_ratio.max(intrinsic.min_pixel_ratio());
+                                intrinsic.to_plot_size()
+                            },
                             None => {
                                 return Err(anyhow!(
                                     "No size provided for plot {id} and no intrinsic size available"
@@ -506,7 +510,7 @@ impl DeviceContext {
                         width: size.width,
                         height: size.height,
                     },
-                    pixel_ratio: plot_meta.pixel_ratio,
+                    pixel_ratio,
                     format: plot_meta.format,
                 };
 
@@ -710,7 +714,7 @@ impl DeviceContext {
     fn store_plot_context(&self, id: &PlotId, ctx: &ExecutionContext) {
         let kind = self.detect_plot_kind(id);
         let name = self.generate_plot_name(&kind);
-        let origin = self.take_pending_origin(ctx);
+        let origin = self.take_pending_origin(id, ctx);
 
         self.plot_contexts
             .borrow_mut()
@@ -992,6 +996,12 @@ const DEFAULT_DPI: f64 = if cfg!(target_os = "macos") {
 /// Default aspect ratio (width:height) used when only output_width_px is provided.
 const DEFAULT_ASPECT_RATIO: f64 = 4.0 / 3.0;
 
+/// Target DPI for rendering inch-based intrinsic sizes (e.g. Quarto figures).
+/// Quarto's HTML default renders figures at `fig-dpi` (96) scaled by
+/// `fig.retina` (2), i.e. 192 DPI. Matching it keeps intrinsic plots crisp when
+/// the plot pane scales them to fit, independent of the OS base screen DPI.
+const INTRINSIC_RENDER_DPI: f64 = 192.0;
+
 /// Default figure size in inches, matching Quarto's base/HTML format
 /// defaults (`fig-width: 7`, `fig-height: 5`). Other formats differ (e.g.
 /// pdf is 5.5 x 3.5), but Positron doesn't know the target format.
@@ -1004,6 +1014,14 @@ trait IntrinsicSizeExt {
     /// Returns dimensions in CSS/logical pixels. The R rendering layer handles
     /// physical pixel scaling via the separate `pixel_ratio` parameter.
     fn to_plot_size(&self) -> PlotSize;
+
+    /// Minimum pixel ratio for rendering this intrinsic size crisply.
+    ///
+    /// An inch-based size (Quarto) is a physical size that the plot pane may
+    /// scale up to fit, so it needs enough resolution to lift the effective DPI
+    /// (`DEFAULT_DPI * pixel_ratio`) up to `INTRINSIC_RENDER_DPI`. A pixel-based
+    /// size already carries its own resolution, so no floor is applied.
+    fn min_pixel_ratio(&self) -> f64;
 }
 
 impl IntrinsicSizeExt for IntrinsicSize {
@@ -1017,6 +1035,13 @@ impl IntrinsicSizeExt for IntrinsicSize {
                 width: self.width.round() as i64,
                 height: self.height.round() as i64,
             },
+        }
+    }
+
+    fn min_pixel_ratio(&self) -> f64 {
+        match self.unit {
+            PlotUnit::Inches => INTRINSIC_RENDER_DPI / DEFAULT_DPI,
+            PlotUnit::Pixels => 1.0,
         }
     }
 }
