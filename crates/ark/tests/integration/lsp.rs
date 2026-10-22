@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use ark_test::DummyArkFrontend;
 use serde_json::json;
+use serde_json::Value;
 
 #[test]
 fn test_lsp_init() {
@@ -22,6 +23,94 @@ fn test_lsp_init() {
 
     // Verify the server reports completion support
     assert!(lsp.server_capabilities().completion_provider.is_some());
+}
+
+// 157 exceeds the transport's default four active handlers plus 100 buffered
+// handlers. The configuration response is deliberately ordered behind the burst.
+#[test]
+fn test_lsp_configuration_response_survives_request_burst() -> anyhow::Result<()> {
+    let frontend = DummyArkFrontend::lock();
+    let mut lsp = frontend.start_lsp();
+
+    let result = (|| -> anyhow::Result<()> {
+        let uri = lsp.open_document("configuration_response_request_burst.R", "foo <- 1\n");
+        let document_symbol_params = json!({
+            "textDocument": { "uri": uri },
+        });
+        let expected_symbols = json!([
+            {
+                "name": "foo",
+                "kind": 13,
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 8 },
+                },
+                "selectionRange": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 8 },
+                },
+                "children": [],
+            }
+        ]);
+
+        assert_eq!(
+            lsp.send_request(
+                "textDocument/documentSymbol",
+                document_symbol_params.clone()
+            ),
+            expected_symbols
+        );
+
+        lsp.send_notification(
+            "workspace/didChangeConfiguration",
+            json!({ "settings": {} }),
+        );
+        let (configuration_id, configuration_params) =
+            lsp.recv_server_request_without_reply("workspace/configuration");
+        let configuration_items = configuration_params["items"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Missing workspace configuration items"))?;
+
+        let mut ids = Vec::with_capacity(157);
+        for _ in 0..157 {
+            ids.push(lsp.send_request_raw(
+                "textDocument/documentSymbol",
+                document_symbol_params.clone(),
+            ));
+        }
+        lsp.send_server_response(
+            configuration_id,
+            Value::Array(vec![Value::Null; configuration_items.len()]),
+        );
+
+        let responses = lsp.recv_responses(&ids, Duration::from_secs(2))?;
+        assert_eq!(responses.len(), 157);
+        for response in responses {
+            assert_eq!(response, expected_symbols);
+        }
+
+        Ok(())
+    })();
+
+    lsp.disconnect_abruptly();
+    result
+}
+
+#[test]
+fn test_lsp_declares_notebook_sync_for_r_cells() {
+    let frontend = DummyArkFrontend::lock();
+    let lsp = frontend.start_lsp();
+
+    let sync = serde_json::to_value(&lsp.server_capabilities().notebook_document_sync).unwrap();
+    assert_eq!(
+        sync,
+        json!({
+            "notebookSelector": [
+                { "notebook": "jupyter-notebook", "cells": [{ "language": "r" }] },
+                { "notebook": "quarto-cells", "cells": [{ "language": "r" }] },
+            ]
+        })
+    );
 }
 
 // An abrupt client disconnect must not panic the `ark-lsp` thread.
@@ -70,6 +159,8 @@ fn test_lsp_exits_promptly_after_exit_without_client_close() {
 // A panicking request handler must return an error without ending the LSP session.
 #[test]
 fn test_lsp_panicking_request_is_task_local() {
+    ark::panic::install();
+
     let frontend = DummyArkFrontend::lock();
     let mut lsp = frontend.start_lsp();
 
@@ -100,6 +191,8 @@ fn test_lsp_panicking_request_is_task_local() {
 // A notification handler panic must show a crash dialog before closing the LSP connection.
 #[test]
 fn test_lsp_panicking_notification_ends_session() {
+    ark::panic::install();
+
     let frontend = DummyArkFrontend::lock();
     let mut lsp = frontend.start_lsp();
 
@@ -149,6 +242,8 @@ fn test_lsp_panic_across_r_task_ends_session() {
 // A panic outside the per-event boundary must still show the crash dialog before shutdown.
 #[test]
 fn test_lsp_panicking_main_loop_reports_crash() {
+    ark::panic::install();
+
     let frontend = DummyArkFrontend::lock();
     let mut lsp = frontend.start_lsp();
 
@@ -183,6 +278,47 @@ fn test_lsp_reconnect_after_crash_is_functional() {
     assert!(labels.contains(&"paste"));
 
     assert!(lsp.show_messages().is_empty());
+}
+
+// A panic in a `tower-lsp` service future must show the crash dialog while the
+// transport is still running, then close the connection.
+#[test]
+fn test_lsp_panicking_service_reports_crash() {
+    ark::panic::install();
+
+    let frontend = DummyArkFrontend::lock();
+    let mut lsp = frontend.start_lsp();
+
+    lsp.send_notification("ark/testPanicService", json!({}));
+
+    lsp.recv_server_request("window/showMessageRequest");
+    lsp.expect_server_closes_connection(Duration::from_secs(5));
+    lsp.disconnect_abruptly();
+}
+
+// The auxiliary loop catches panics without ending the session. A later log confirms
+// that it continues processing events.
+#[test]
+fn test_lsp_panicking_auxiliary_loop_keeps_running() {
+    ark::panic::install();
+
+    // Capture `log::error!()` because reporting this panic through
+    // `window/logMessage` would recurse into the auxiliary loop.
+    ark_test::install_log_capture();
+
+    let frontend = DummyArkFrontend::lock();
+    let mut lsp = frontend.start_lsp();
+
+    // Wait for this event to complete before queueing the panic behind it.
+    lsp.open_document("aux_before.R", "x <- 1\n");
+    lsp.wait_for_log_message("aux_before.R", Duration::from_secs(10));
+
+    lsp.send_notification("ark/testPanicAuxiliary", json!({}));
+
+    ark_test::wait_for_captured_log("Panic in the auxiliary loop", Duration::from_secs(10));
+
+    lsp.open_document("aux_after.R", "y <- 2\n");
+    lsp.wait_for_log_message("aux_after.R", Duration::from_secs(10));
 }
 
 // The two cases below test errors that don't depend on the rename

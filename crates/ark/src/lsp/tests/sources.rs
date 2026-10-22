@@ -9,8 +9,8 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use oak_db::Db;
 use oak_db::OakDatabase;
+use oak_db::SourceDb;
 use oak_scan::DbScan;
 use serde_json::json;
 use serde_json::Value;
@@ -33,6 +33,7 @@ use super::utils::write_sources;
 use super::utils::DescriptionWriter;
 use super::utils::TestClient;
 use crate::lsp::backend::RequestResponse;
+use crate::lsp::config::env_settings;
 use crate::lsp::config::initialization_options;
 use crate::lsp::config::LspSettings;
 use crate::lsp::config::OAK_SOURCE_FETCHING_ENABLED_ENV_VAR;
@@ -139,7 +140,7 @@ async fn test_source_pipeline_ingests_package_sources() {
     }
 
     // `donor` now carries the ingested source file, readable from disk.
-    let db = &state.world().db;
+    let db = state.world().db();
     let donor = db.package_by_name("donor").unwrap();
     let files = donor.files(db).clone();
     assert_eq!(files.len(), 1);
@@ -190,13 +191,13 @@ async fn test_disabled_source_fetching_dispatches_nothing() {
     state.handle_event_to_quiescence(initialized()).await;
 
     assert_eq!(client.answered_requests(), vec![
-        "client/registerCapability",
-        "workspace/configuration"
+        Ok::<_, String>(String::from("client/registerCapability")),
+        Ok::<_, String>(String::from("workspace/configuration"))
     ]);
     assert!(handler.calls().lock().unwrap().is_empty());
 
     // The dependency is indexed even though its sources were not fetched.
-    let db = &state.world().db;
+    let db = state.world().db();
     let donor = db.package_by_name("donor").unwrap();
     assert!(donor.files(db).is_empty());
 }
@@ -245,9 +246,9 @@ async fn test_configuration_not_pulled_without_capability() {
     state.handle_event_to_quiescence(event).await;
     state.handle_event_to_quiescence(initialized()).await;
 
-    assert_eq!(client.answered_requests(), vec![
-        "client/registerCapability"
-    ]);
+    assert_eq!(client.answered_requests(), vec![Ok::<_, String>(
+        String::from("client/registerCapability")
+    )]);
     assert!(state.world().config.oak.source_fetching_enabled);
     assert_eq!(dispatched_names(handler.calls()), vec!["donor"]);
 }
@@ -355,36 +356,38 @@ async fn test_initialization_options_survive_a_silent_pull() {
     state.handle_event_to_quiescence(initialized()).await;
 
     assert_eq!(client.answered_requests(), vec![
-        "client/registerCapability",
-        "workspace/configuration"
+        Ok::<_, String>(String::from("client/registerCapability")),
+        Ok::<_, String>(String::from("workspace/configuration"))
     ]);
     assert!(!state.world().config.oak.source_fetching_enabled);
     assert!(handler.calls().lock().unwrap().is_empty());
 }
 
-/// The environment setting overrides `initializationOptions`.
+/// The environment layer overrides `initializationOptions`.
 #[test]
 fn test_env_var_beats_initialization_options() {
-    let name = OAK_SOURCE_FETCHING_ENABLED_ENV_VAR;
-    let options = json!({ "oak": { "sourceFetching": { "enabled": false } } });
+    let options =
+        initialization_options(&json!({ "oak": { "sourceFetching": { "enabled": false } } }));
+    let env = LspSettings {
+        source_fetching_enabled: Some(true),
+        ..Default::default()
+    };
 
-    let resolve =
-        || resolved_source_fetching(initialization_options(&options), LspSettings::default());
-
-    unsafe { std::env::remove_var(name) };
-    assert!(!resolve());
-
-    unsafe { std::env::set_var(name, "1") };
-    assert!(resolve());
-
-    unsafe { std::env::remove_var(name) };
+    assert!(!resolved_source_fetching(
+        LspSettings::default(),
+        options.clone(),
+        LspSettings::default()
+    ));
+    assert!(resolved_source_fetching(
+        env,
+        options,
+        LspSettings::default()
+    ));
 }
 
 /// A pulled value overrides `initializationOptions` for the same setting.
 #[test]
 fn test_pulled_setting_beats_initialization_options() {
-    unsafe { std::env::remove_var(OAK_SOURCE_FETCHING_ENABLED_ENV_VAR) };
-
     let options = initialization_options(&json!({
         "oak": { "sourceFetching": { "enabled": false } }
     }));
@@ -393,17 +396,28 @@ fn test_pulled_setting_beats_initialization_options() {
         source_fetching_enabled: Some(true),
         ..Default::default()
     };
-    assert!(resolved_source_fetching(options.clone(), pulled));
+    assert!(resolved_source_fetching(
+        LspSettings::default(),
+        options.clone(),
+        pulled
+    ));
 
     // An absent pulled value preserves the initialization option.
-    assert!(!resolved_source_fetching(options, LspSettings::default()));
+    assert!(!resolved_source_fetching(
+        LspSettings::default(),
+        options,
+        LspSettings::default()
+    ));
 }
 
-fn resolved_source_fetching(options: LspSettings, client_settings: LspSettings) -> bool {
-    let mut state = WorldState {
-        initialization_options: options,
-        ..Default::default()
-    };
+fn resolved_source_fetching(
+    env: LspSettings,
+    options: LspSettings,
+    client_settings: LspSettings,
+) -> bool {
+    let mut state = WorldState::default();
+    state.env_settings = env;
+    state.initialization_options = options;
     state.resolve_config(client_settings);
     state.config.oak.source_fetching_enabled
 }
@@ -486,7 +500,7 @@ async fn test_reenabling_fetches_packages_seen_while_off() {
     // `donor` was declined while off, so it is still on offer and gets fetched
     // now, sources and all.
     assert_eq!(dispatched_names(handler.calls()), vec!["donor"]);
-    let db = &state.world().db;
+    let db = state.world().db();
     let donor = db.package_by_name("donor").unwrap();
     let files = donor.files(db).clone();
     assert_eq!(files.len(), 1);
@@ -494,9 +508,9 @@ async fn test_reenabling_fetches_packages_seen_while_off() {
 
     // Each configuration pull consumes one client response.
     assert_eq!(client.answered_requests(), vec![
-        "client/registerCapability",
-        "workspace/configuration",
-        "workspace/configuration"
+        Ok::<_, String>(String::from("client/registerCapability")),
+        Ok::<_, String>(String::from("workspace/configuration")),
+        Ok::<_, String>(String::from("workspace/configuration"))
     ]);
 }
 
@@ -573,7 +587,7 @@ async fn test_disabling_stops_fetching_new_packages() {
     // `donor2` was discovered by the second scan but never dispatched, and
     // `donor1` keeps the sources it already has.
     assert_eq!(dispatched_names(handler.calls()), vec!["donor1"]);
-    let db = &state.world().db;
+    let db = state.world().db();
     assert!(db.package_by_name("donor2").unwrap().files(db).is_empty());
     assert_eq!(db.package_by_name("donor1").unwrap().files(db).len(), 1);
 }
@@ -804,7 +818,7 @@ async fn check_fetching_waits_for_initialized(
 
     // The initial scan discovered the dependency without fetching its sources.
     assert!(handler.calls().lock().unwrap().is_empty());
-    let db = &state.world().db;
+    let db = state.world().db();
     let donor = db.package_by_name("donor").unwrap();
     assert!(donor.files(db).is_empty());
 
@@ -850,7 +864,7 @@ fn test_env_var_overrides_the_setting() {
             source_fetching_enabled: Some(client_says),
             ..Default::default()
         };
-        resolved_source_fetching(LspSettings::default(), client_settings)
+        resolved_source_fetching(env_settings(), LspSettings::default(), client_settings)
     };
 
     unsafe { std::env::remove_var(name) };
@@ -991,7 +1005,7 @@ async fn test_source_pipeline_ingests_real_srcref_sources() {
 
     // {generics} now carries its recovered sources, readable from disk. {generics} is a
     // package of S3 generics, so every recovered file is full of `UseMethod()` calls.
-    let db = &state.world().db;
+    let db = state.world().db();
     let generics = db.package_by_name("generics").unwrap();
     let files = generics.files(db).clone();
     assert!(!files.is_empty());

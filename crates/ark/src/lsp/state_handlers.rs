@@ -11,23 +11,24 @@ use std::path::PathBuf;
 use aether_path::AbsPathBuf;
 use aether_path::FilePath;
 use anyhow::anyhow;
+use oak_db::File;
 use oak_scan::DbScan;
-use oak_scan::FileEvent;
-use oak_scan::FileEventKind;
 use stdext::result::ResultExt;
 use tower_lsp_server::ls_types as lsp_types;
 use tower_lsp_server::ls_types::CompletionOptions;
 use tower_lsp_server::ls_types::CompletionOptionsCompletionItem;
 use tower_lsp_server::ls_types::DidChangeConfigurationParams;
+use tower_lsp_server::ls_types::DidChangeNotebookDocumentParams;
 use tower_lsp_server::ls_types::DidChangeTextDocumentParams;
 use tower_lsp_server::ls_types::DidChangeWatchedFilesParams;
 use tower_lsp_server::ls_types::DidChangeWatchedFilesRegistrationOptions;
 use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
+use tower_lsp_server::ls_types::DidCloseNotebookDocumentParams;
 use tower_lsp_server::ls_types::DidCloseTextDocumentParams;
+use tower_lsp_server::ls_types::DidOpenNotebookDocumentParams;
 use tower_lsp_server::ls_types::DidOpenTextDocumentParams;
 use tower_lsp_server::ls_types::DocumentOnTypeFormattingOptions;
 use tower_lsp_server::ls_types::ExecuteCommandOptions;
-use tower_lsp_server::ls_types::FileChangeType;
 use tower_lsp_server::ls_types::FileSystemWatcher;
 use tower_lsp_server::ls_types::FoldingRangeProviderCapability;
 use tower_lsp_server::ls_types::FormattingOptions;
@@ -36,6 +37,11 @@ use tower_lsp_server::ls_types::HoverProviderCapability;
 use tower_lsp_server::ls_types::ImplementationProviderCapability;
 use tower_lsp_server::ls_types::InitializeParams;
 use tower_lsp_server::ls_types::InitializeResult;
+use tower_lsp_server::ls_types::Notebook;
+use tower_lsp_server::ls_types::NotebookCellArrayChange;
+use tower_lsp_server::ls_types::NotebookCellSelector;
+use tower_lsp_server::ls_types::NotebookDocumentSyncOptions;
+use tower_lsp_server::ls_types::NotebookSelector;
 use tower_lsp_server::ls_types::OneOf;
 use tower_lsp_server::ls_types::Registration;
 use tower_lsp_server::ls_types::RenameOptions;
@@ -43,13 +49,13 @@ use tower_lsp_server::ls_types::SelectionRangeProviderCapability;
 use tower_lsp_server::ls_types::ServerCapabilities;
 use tower_lsp_server::ls_types::ServerInfo;
 use tower_lsp_server::ls_types::SignatureHelpOptions;
+use tower_lsp_server::ls_types::TextDocumentIdentifier;
 use tower_lsp_server::ls_types::TextDocumentSyncCapability;
 use tower_lsp_server::ls_types::TextDocumentSyncKind;
 use tower_lsp_server::ls_types::Uri;
 use tower_lsp_server::ls_types::WorkDoneProgressOptions;
 use tower_lsp_server::ls_types::WorkspaceFoldersServerCapabilities;
 use tower_lsp_server::ls_types::WorkspaceServerCapabilities;
-use tracing::Instrument;
 
 use crate::console::ConsoleNotification;
 use crate::lsp;
@@ -128,6 +134,13 @@ pub(crate) fn initialize(
             text_document_sync: Some(TextDocumentSyncCapability::Kind(
                 TextDocumentSyncKind::INCREMENTAL,
             )),
+            // Notebook sync supplies cell order and replaces `textDocument/did*`
+            // notifications for selected R cells. Positron also exposes Quarto
+            // and R Markdown documents as `quarto-cells` notebooks.
+            notebook_document_sync: Some(OneOf::Left(NotebookDocumentSyncOptions {
+                notebook_selector: vec![r_cells_of("jupyter-notebook"), r_cells_of("quarto-cells")],
+                save: None,
+            })),
             selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
             hover_provider: Some(HoverProviderCapability::from(true)),
             completion_provider: Some(CompletionOptions {
@@ -187,6 +200,15 @@ pub(crate) fn initialize(
     Ok(result)
 }
 
+fn r_cells_of(notebook_type: &str) -> NotebookSelector {
+    NotebookSelector::ByNotebook {
+        notebook: Notebook::String(notebook_type.to_string()),
+        cells: Some(vec![NotebookCellSelector {
+            language: String::from("r"),
+        }]),
+    }
+}
+
 /// Resolve the effective workspace folders from `InitializeParams`.
 ///
 /// We read only `workspaceFolders`, the modern field , without falling back to
@@ -203,20 +225,19 @@ pub(super) fn effective_workspace_paths(params: &InitializeParams) -> Vec<AbsPat
         .collect()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(crate) async fn handle_initialized(
     client: &tower_lsp_server::Client,
     lsp_state: &mut LspState,
     state: &mut WorldState,
     events_tx: &TokioUnboundedSender<Event>,
 ) {
-    let span = tracing::info_span!("handle_initialized").entered();
-
     // Register capabilities to the client
     let mut regs: Vec<Registration> = vec![];
 
-    // Watch R files and DESCRIPTION. We get notified on any disk change;
-    // the handler skips editor-owned URLs since those are tracked via
-    // `textDocument/did*` instead.
+    // Editor-owned R files are tracked via `textDocument/did*`, so the handler
+    // skips their disk events. `DESCRIPTION` and environment sentinels still
+    // trigger rescans even when open in the editor.
     let watchers = vec![
         FileSystemWatcher {
             glob_pattern: GlobPattern::String("**/*.{R,r}".to_string()),
@@ -224,6 +245,10 @@ pub(crate) async fn handle_initialized(
         },
         FileSystemWatcher {
             glob_pattern: GlobPattern::String("**/DESCRIPTION".to_string()),
+            kind: None,
+        },
+        FileSystemWatcher {
+            glob_pattern: GlobPattern::String("**/{.Rprofile,.Renviron}".to_string()),
             kind: None,
         },
     ];
@@ -269,11 +294,7 @@ pub(crate) async fn handle_initialized(
         }
     }
 
-    client
-        .register_capability(regs)
-        .instrument(span.exit())
-        .await
-        .log_err();
+    client.register_capability(regs).await.log_err();
 
     update_config(
         open_file_wire_uris(state),
@@ -302,7 +323,7 @@ pub(crate) async fn handle_initialized(
     }
 
     lsp_state.source_scheduler.schedule(
-        &state.db,
+        state.db(),
         &state.config.oak,
         &lsp_state.source_pool,
         events_tx,
@@ -319,7 +340,7 @@ pub(crate) fn did_open(
     let path = wire_uri.to_document_path()?;
     let version = params.text_document.version;
 
-    let file = state.db.upsert_editor(path.clone(), contents);
+    let file = state.db_mut().upsert_editor(path.clone(), contents);
     state.insert_open_file(wire_uri, path, file, Some(version));
 
     // NOTE: Do we need to call `update_config()` here?
@@ -355,11 +376,11 @@ pub(crate) fn did_change(
 
     // Fold the edits into the new buffer text and push it into `oak`
     let new_contents = apply_content_changes(
-        file.source_text(&state.db).as_str(),
+        file.source_text(state.db()).as_str(),
         &params.content_changes,
         encoding,
     );
-    state.db.upsert_editor(path.clone(), new_contents);
+    state.db_mut().upsert_editor(path.clone(), new_contents);
 
     state.open_file_mut(&path)?.set_version(Some(new_version));
 
@@ -393,12 +414,157 @@ pub(crate) fn did_close(
         wire_uri.as_str()
     ))?;
 
-    state.db.close_editor(&path);
+    state.db_mut().close_editor(&path);
 
     lsp::log_info!(
         "did_close(): closed document with URI: '{}'.",
         wire_uri.as_str()
     );
+
+    Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all)]
+pub(crate) fn did_open_notebook(
+    params: DidOpenNotebookDocumentParams,
+    state: &mut WorldState,
+) -> anyhow::Result<()> {
+    for text_document in params.cell_text_documents {
+        did_open(DidOpenTextDocumentParams { text_document }, state)?;
+    }
+
+    let path = params.notebook_document.uri.to_document_path()?;
+    let cells = params
+        .notebook_document
+        .cells
+        .iter()
+        .map(|cell| cell.document.to_document_path())
+        .collect::<anyhow::Result<Vec<FilePath>>>()?;
+    state.notebooks.insert(path.clone(), cells);
+
+    push_notebook_cells(state, &path)
+}
+
+/// Excludes cells without synced text, such as Markdown cells, because only
+/// entries in `open_files` have a [`File`] to register with oak.
+fn push_notebook_cells(state: &mut WorldState, path: &FilePath) -> anyhow::Result<()> {
+    let Some(cell_paths) = state.notebooks.get(path) else {
+        return Err(anyhow!("Unknown notebook {path}"));
+    };
+    let cells: Vec<File> = cell_paths
+        .iter()
+        .filter_map(|cell| state.open_files.get(cell))
+        .map(|open_file| open_file.file())
+        .collect();
+
+    state.db_mut().set_notebook_cells(path.clone(), cells);
+    Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all)]
+pub(crate) fn did_change_notebook(
+    params: DidChangeNotebookDocumentParams,
+    lsp_state: &mut LspState,
+    state: &mut WorldState,
+) -> anyhow::Result<()> {
+    let path = params.notebook_document.uri.to_document_path()?;
+
+    // Ignore unopened notebooks because the client sends edits to every
+    // matching server even when `filterCells()` excluded the notebook on open.
+    if !state.notebooks.contains_key(&path) {
+        log::trace!("Ignoring change to notebook {path}, which is not open");
+        return Ok(());
+    }
+
+    let Some(cells) = params.change.cells else {
+        return Ok(());
+    };
+
+    if let Some(structure) = cells.structure {
+        for text_document in structure.did_open.into_iter().flatten() {
+            did_open(DidOpenTextDocumentParams { text_document }, state)?;
+        }
+        apply_cell_splice(state, &path, &structure.array)?;
+        for text_document in structure.did_close.into_iter().flatten() {
+            did_close(DidCloseTextDocumentParams { text_document }, state)?;
+        }
+
+        // Cell membership and the set of synced buffers only change here, so
+        // text-only edits skip the oak update entirely.
+        push_notebook_cells(state, &path)?;
+    }
+
+    for content in cells.text_content.into_iter().flatten() {
+        let params = DidChangeTextDocumentParams {
+            text_document: content.document,
+            content_changes: content.changes,
+        };
+        did_change(params, lsp_state, state)?;
+    }
+
+    Ok(())
+}
+
+fn apply_cell_splice(
+    state: &mut WorldState,
+    path: &FilePath,
+    array: &NotebookCellArrayChange,
+) -> anyhow::Result<()> {
+    let inserted = array
+        .cells
+        .iter()
+        .flatten()
+        .map(|cell| cell.document.to_document_path())
+        .collect::<anyhow::Result<Vec<FilePath>>>()?;
+
+    let Some(cells) = state.notebooks.get_mut(path) else {
+        return Err(anyhow!("Unknown notebook {path}"));
+    };
+
+    let start = array.start as usize;
+    let end = start + array.delete_count as usize;
+    if end > cells.len() {
+        return Err(anyhow!(
+            "Cell splice {start}..{end} is out of range for notebook {path} with {len} cells",
+            len = cells.len()
+        ));
+    }
+
+    cells.splice(start..end, inserted);
+    Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all)]
+pub(crate) fn did_close_notebook(
+    params: DidCloseNotebookDocumentParams,
+    state: &mut WorldState,
+) -> anyhow::Result<()> {
+    let path = params.notebook_document.uri.to_document_path()?;
+
+    // Forget the order before closing the cells, so no query sees a notebook
+    // that lists closed cells.
+    let known_cells = state.notebooks.remove(&path).unwrap_or_default();
+    state.db_mut().close_notebook(&path);
+
+    // Include remembered cells because deleting the last R cell closes the
+    // notebook, but the client's close notification omits that deleted cell.
+    // Checking `open_files` below prevents closing a cell twice.
+    let mut cells = params
+        .cell_text_documents
+        .iter()
+        .map(|text_document| text_document.uri.to_document_path())
+        .collect::<anyhow::Result<Vec<FilePath>>>()?;
+    cells.extend(known_cells);
+
+    for cell in cells {
+        let Some(open_file) = state.open_files.get(&cell) else {
+            continue;
+        };
+        let text_document = TextDocumentIdentifier {
+            uri: open_file.wire_uri().clone(),
+        };
+        did_close(DidCloseTextDocumentParams { text_document }, state)?;
+    }
 
     Ok(())
 }
@@ -414,33 +580,21 @@ pub(crate) fn did_change_watched_files(
     // for those URLs. Their content comes from `did_open` / `did_change`.
     let editor_owned: HashSet<FilePath> = state.open_files.keys().cloned().collect();
 
-    let events: Vec<FileEvent> = params
+    // The change type is dropped: the scheduler reconciles each path against
+    // the disk when it applies.
+    let paths: Vec<FilePath> = params
         .changes
         .iter()
-        .filter_map(|change| {
-            Some(FileEvent {
-                path: change.uri.to_document_path().log_err()?,
-                kind: file_event_kind(change.typ)?,
-            })
-        })
+        .filter_map(|change| change.uri.to_document_path().log_err())
         .collect();
 
     let requests =
         lsp_state
             .oak_scheduler
-            .apply_watcher_events(&mut state.db, events, &editor_owned);
+            .apply_watcher_events(state.db_mut(), paths, &editor_owned);
     dispatch_scan_requests(&lsp_state.scan_pool, events_tx, requests);
 
     Ok(())
-}
-
-fn file_event_kind(kind: FileChangeType) -> Option<FileEventKind> {
-    match kind {
-        FileChangeType::CREATED => Some(FileEventKind::Created),
-        FileChangeType::CHANGED => Some(FileEventKind::Changed),
-        FileChangeType::DELETED => Some(FileEventKind::Deleted),
-        _ => None,
-    }
 }
 
 #[tracing::instrument(level = "info", skip_all)]
@@ -490,11 +644,11 @@ fn dispatch_workspace_scan(
     // folder goes away.
     let editor_owned: HashSet<FilePath> = state.open_files.keys().cloned().collect();
 
-    let requests = lsp_state.oak_scheduler.set_workspace_paths(
-        &mut state.db,
-        &to_std_paths(&state.workspace.folders),
-        &editor_owned,
-    );
+    let folders = to_std_paths(&state.workspace.folders);
+    let requests =
+        lsp_state
+            .oak_scheduler
+            .set_workspace_paths(state.db_mut(), &folders, &editor_owned);
     dispatch_scan_requests(&lsp_state.scan_pool, events_tx, requests);
 }
 
@@ -507,6 +661,7 @@ fn to_std_paths(paths: &[AbsPathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(crate) async fn did_change_configuration(
     _params: DidChangeConfigurationParams,
     client: &tower_lsp_server::Client,
@@ -522,9 +677,7 @@ pub(crate) async fn did_change_configuration(
 
     let was_enabled = state.config.oak.source_fetching_enabled;
 
-    let result = update_config(open_file_wire_uris(state), client, capabilities, state)
-        .instrument(tracing::info_span!("did_change_configuration"))
-        .await;
+    let result = update_config(open_file_wire_uris(state), client, capabilities, state).await;
 
     // Report only changes after startup. `handle_initialized()` reports the initial state.
     if state.config.oak.source_fetching_enabled != was_enabled {

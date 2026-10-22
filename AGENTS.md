@@ -82,6 +82,14 @@ just test -p ark
 
 Put integration tests under `crates/<crate>/tests/integration/`, with a `main.rs` that declares each test file as a module (`mod library;`). Don't add loose `*.rs` files directly under `tests/`. Each top-level file there compiles as its own test binary, so consolidating them into one `integration` binary keeps build and link times down and saves on disk space.
 
+### Running Benchmarks
+
+```sh
+just bench
+```
+
+See the `bench*` recipes in the `justfile` for comparing against baselines and for how fixtures are populated.
+
 ### Running Clippy
 
 ```sh
@@ -91,10 +99,10 @@ just clippy
 ### Formatting
 
 ```sh
-cargo +nightly fmt --all
+just format
 ```
 
-This requires the nightly toolchain because `.rustfmt.toml` uses nightly-only options.
+This runs `cargo +nightly fmt --all` for Rust and `air format .` for R. The nightly toolchain is required because `.rustfmt.toml` uses nightly-only options, and [Air](https://posit-dev.github.io/air/) must be on the `PATH` or installed as a Positron or VS Code extension.
 
 ### Kernel and DAP Test Infrastructure
 
@@ -159,11 +167,13 @@ The following R packages are required for tests:
 - data.table
 - dplyr
 - rstudioapi
+- S7
 - tibble
 - haven
 - htmltools
 - R6
 - readr
+- renv
 
 ### Installation
 
@@ -180,6 +190,14 @@ After building, you can install the Jupyter kernel specification with:
 Some of the files below `crates/amalthea/src/comm/` are automatically generated from comms specified in the Positron front end.
 Such files always have `// @generated` at the top and SHOULD NEVER be edited "by hand".
 If changes are needed in these files, that must happen in the separate Positron source repository and the comms for R and Python must be regenerated.
+
+## Salsa queries
+
+Changes to Salsa queries may require cycle handling and an updated `salsa_inventory` snapshot. Follow `doc/oak/salsa.md` when changing a tracked query or code reachable from one.
+
+## Markdown
+
+Do not hard-wrap Markdown source. Keep each paragraph and list item on one line, and let the editor wrap it visually.
 
 ## Coding Style
 

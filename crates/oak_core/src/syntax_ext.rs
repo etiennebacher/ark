@@ -34,9 +34,9 @@ pub trait RStringValueExt {
 
 impl RStringValueExt for RStringValue {
     fn string_text(&self) -> Option<String> {
-        // The content token is absent for empty strings like `""`.
-        match self.content_token() {
-            Some(token) => Some(token.text_trimmed().to_string()),
+        // The inner text is empty for strings like `""`.
+        match self.inner_string_text().ok() {
+            Some(text) => Some(text.to_string()),
             None => Some(String::new()),
         }
     }
@@ -57,7 +57,7 @@ impl AnyRSelectorExt for AnyRSelector {
         match self {
             AnyRSelector::RIdentifier(node) => Some(node.name_text()),
             AnyRSelector::RStringValue(node) => node.string_text(),
-            AnyRSelector::RDots(_) | AnyRSelector::RDotDotI(_) => None,
+            AnyRSelector::RDots(_) | AnyRSelector::RDotDotI(_) | AnyRSelector::RBogusSelector(_) => None,
         }
     }
 }
@@ -92,7 +92,7 @@ mod tests {
 
     fn parse_single_expr(code: &str) -> AnyRExpression {
         let parsed = aether_parser::parse(code, RParserOptions::default());
-        parsed.tree().expressions().iter().next().unwrap()
+        parsed.tree().statements().iter().next().unwrap().as_r_expression_statement().unwrap().expression().unwrap()
     }
 
     #[test]

@@ -83,7 +83,7 @@ impl LspClient {
             }
 
             match self.recv_any() {
-                LspMessage::Notification { diagnostics } => {
+                LspMessage::Notification { diagnostics, .. } => {
                     if let Some(params) = diagnostics {
                         self.diagnostics.insert(params.uri, params.diagnostics);
                     }
@@ -253,7 +253,7 @@ impl LspClient {
 
     /// Wire-level request send. Allocates an id, frames the message, ships
     /// it, and returns the id so the caller can await a matching response.
-    fn send_request_raw(&mut self, method: &str, params: Value) -> i64 {
+    pub fn send_request_raw(&mut self, method: &str, params: Value) -> i64 {
         self.next_id += 1;
         let id = self.next_id;
 
@@ -281,6 +281,83 @@ impl LspClient {
         }
 
         self.send_raw(&message);
+    }
+
+    /// Send a response to a server-to-client request.
+    pub fn send_server_response(&mut self, id: Value, result: Value) {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        });
+        self.send_raw(&response);
+    }
+
+    /// Receive responses for `ids` before one shared deadline.
+    ///
+    /// Buffers diagnostics notifications for later assertion via
+    /// `diagnostics()`. Returns successful results in `ids` order even when
+    /// the server sends responses out of order.
+    pub fn recv_responses(&mut self, ids: &[i64], timeout: Duration) -> anyhow::Result<Vec<Value>> {
+        let result = (|| {
+            let mut positions = std::collections::HashMap::new();
+            for (position, id) in ids.iter().enumerate() {
+                if positions.insert(*id, position).is_some() {
+                    return Err(anyhow::anyhow!("Duplicate expected response id: {id}"));
+                }
+            }
+
+            let deadline = std::time::Instant::now() + timeout;
+            let mut results = vec![None; ids.len()];
+
+            while results.iter().any(Option::is_none) {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(anyhow::anyhow!(
+                        "Timed out waiting for LSP responses within {timeout:?}"
+                    ));
+                }
+                self.reader.get_ref().set_read_timeout(Some(remaining))?;
+
+                match self.try_recv_any()? {
+                    LspMessage::Response { id, result, error } => {
+                        let Some(position) = positions.get(&id) else {
+                            return Err(anyhow::anyhow!("Unexpected LSP response id: {id}"));
+                        };
+                        if results[*position].is_some() {
+                            return Err(anyhow::anyhow!("Duplicate LSP response id: {id}"));
+                        }
+                        if let Some(error) = error {
+                            return Err(anyhow::anyhow!("LSP error response for id {id}: {error}"));
+                        }
+                        results[*position] = Some(match result {
+                            Some(result) => result,
+                            None => Value::Null,
+                        });
+                    },
+                    LspMessage::ServerRequest { method, .. } => {
+                        return Err(anyhow::anyhow!(
+                            "Unexpected LSP server request `{method}` while waiting for responses"
+                        ));
+                    },
+                    LspMessage::Notification { diagnostics, .. } => {
+                        if let Some(params) = diagnostics {
+                            self.diagnostics.insert(params.uri, params.diagnostics);
+                        }
+                    },
+                }
+            }
+
+            results
+                .into_iter()
+                .collect::<Option<Vec<Value>>>()
+                .ok_or_else(|| anyhow::anyhow!("Missing LSP response result"))
+        })();
+
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(DEFAULT_TIMEOUT))?;
+        result
     }
 
     /// Send the `shutdown` request followed by the `exit` notification.
@@ -348,6 +425,58 @@ impl LspClient {
                     }
                     // Any other error here (e.g. clean EOF) means the server hung up, as expected.
                     return;
+                },
+            }
+        }
+    }
+
+    /// Wait for a `window/logMessage` containing `substring`.
+    ///
+    /// Buffers diagnostics notifications. Error and warning logs not allowed by
+    /// [`allow_log_message()`] panic, as do unexpected requests, responses, and timeouts.
+    #[track_caller]
+    pub fn wait_for_log_message(&mut self, substring: &str, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                panic!("No log message containing {substring:?} received within {timeout:?}");
+            }
+            self.reader
+                .get_ref()
+                .set_read_timeout(Some(remaining))
+                .unwrap();
+
+            match self.try_recv_any() {
+                Ok(LspMessage::Notification { diagnostics, log }) => {
+                    if let Some(params) = diagnostics {
+                        self.diagnostics.insert(params.uri, params.diagnostics);
+                    }
+                    if log.is_some_and(|text| text.contains(substring)) {
+                        self.reader
+                            .get_ref()
+                            .set_read_timeout(Some(DEFAULT_TIMEOUT))
+                            .unwrap();
+                        return;
+                    }
+                },
+                Ok(other) => panic!(
+                    "Unexpected message while waiting for log message containing {substring:?}: {other:?}"
+                ),
+                Err(err) => {
+                    let timed_out = err.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+                        matches!(
+                            io_err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        )
+                    });
+                    if timed_out {
+                        panic!(
+                            "No log message containing {substring:?} received within {timeout:?}"
+                        );
+                    }
+                    panic!("Failed to receive LSP message: {err}");
                 },
             }
         }
@@ -421,7 +550,7 @@ impl LspClient {
                         "Unexpected LSP server request `{req_method}` while waiting for response to `{method}`"
                     );
                 },
-                LspMessage::Notification { diagnostics } => {
+                LspMessage::Notification { diagnostics, .. } => {
                     if let Some(params) = diagnostics {
                         self.diagnostics.insert(params.uri, params.diagnostics);
                     }
@@ -436,6 +565,16 @@ impl LspClient {
     /// Skips benign server notifications. Panics on unexpected messages.
     #[track_caller]
     pub fn recv_server_request(&mut self, expected_method: &str) {
+        let (id, params) = self.recv_server_request_without_reply(expected_method);
+        self.send_server_response(id, Self::reply_to_server_request(expected_method, &params));
+    }
+
+    /// Receive the next server-to-client request, assert its method, and leave
+    /// its response to the caller.
+    ///
+    /// Skips benign server notifications. Panics on unexpected messages.
+    #[track_caller]
+    pub fn recv_server_request_without_reply(&mut self, expected_method: &str) -> (Value, Value) {
         loop {
             match self.recv_any() {
                 LspMessage::ServerRequest { id, method, params } => {
@@ -443,15 +582,9 @@ impl LspClient {
                         method, expected_method,
                         "Expected server request `{expected_method}`, got `{method}`"
                     );
-                    let response = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": Self::reply_to_server_request(&method, &params),
-                    });
-                    self.send_raw(&response);
-                    return;
+                    return (id, params);
                 },
-                LspMessage::Notification { diagnostics } => {
+                LspMessage::Notification { diagnostics, .. } => {
                     if let Some(params) = diagnostics {
                         self.diagnostics.insert(params.uri, params.diagnostics);
                     }
@@ -491,6 +624,7 @@ enum LspMessage {
     },
     Notification {
         diagnostics: Option<lsp_types::PublishDiagnosticsParams>,
+        log: Option<String>,
     },
 }
 
@@ -498,12 +632,18 @@ impl LspClient {
     /// Read one JSON-RPC message and classify it, checking notifications
     /// for errors along the way.
     fn recv_any(&mut self) -> LspMessage {
-        let message = self.recv_message().expect("Failed to receive LSP message");
+        self.try_recv_any()
+            .unwrap_or_else(|err| panic!("Failed to receive LSP message: {err}"))
+    }
+
+    /// Return read errors so [`wait_for_log_message()`] can distinguish timeouts.
+    fn try_recv_any(&mut self) -> anyhow::Result<LspMessage> {
+        let message = self.recv_message()?;
         let has_id = message.contains_key("id");
         let has_method = message.contains_key("method");
         let has_result = message.contains_key("result") || message.contains_key("error");
 
-        match (has_id, has_method, has_result) {
+        let message = match (has_id, has_method, has_result) {
             (true, false, true) => LspMessage::Response {
                 id: message["id"].as_i64().unwrap(),
                 result: message.get("result").cloned(),
@@ -517,19 +657,21 @@ impl LspClient {
             },
 
             (false, true, false) => {
-                let diagnostics = self.check_server_notification(&message);
-                LspMessage::Notification { diagnostics }
+                let (diagnostics, log) = self.check_server_notification(&message);
+                LspMessage::Notification { diagnostics, log }
             },
 
             _ => panic!("Unrecognised LSP message shape: {message:?}"),
-        }
+        };
+
+        Ok(message)
     }
 
-    /// Check a server notification, returning parsed diagnostics if applicable.
+    /// Parse recognized server notifications into diagnostics or log text.
     fn check_server_notification(
         &mut self,
         message: &serde_json::Map<String, Value>,
-    ) -> Option<lsp_types::PublishDiagnosticsParams> {
+    ) -> (Option<lsp_types::PublishDiagnosticsParams>, Option<String>) {
         let method = message["method"].as_str().unwrap_or("unknown");
         match method {
             "window/logMessage" => {
@@ -537,11 +679,11 @@ impl LspClient {
                 // failures so they don't go unnoticed.
                 // MessageType: 1 = Error, 2 = Warning, 3 = Info, 4 = Log
                 let msg_type = message["params"]["type"].as_u64().unwrap_or(0);
+                let text = message["params"]["message"]
+                    .as_str()
+                    .unwrap_or("(no message)");
                 if msg_type <= 2 {
                     let level = if msg_type == 1 { "error" } else { "warning" };
-                    let text = message["params"]["message"]
-                        .as_str()
-                        .unwrap_or("(no message)");
                     if !self
                         .allowed_log_messages
                         .iter()
@@ -550,20 +692,20 @@ impl LspClient {
                         panic!("LSP server {level}: {text}");
                     }
                 }
-                None
+                (None, Some(text.to_string()))
             },
             "window/showMessage" => {
                 let text = message["params"]["message"]
                     .as_str()
                     .unwrap_or("(no message)");
                 self.show_messages.push(text.to_string());
-                None
+                (None, None)
             },
             "textDocument/publishDiagnostics" => {
                 let params: lsp_types::PublishDiagnosticsParams =
                     serde_json::from_value(message["params"].clone())
                         .expect("Failed to parse publishDiagnostics params");
-                Some(params)
+                (Some(params), None)
             },
             _ => panic!("Unexpected LSP notification `{method}`: {message:?}"),
         }

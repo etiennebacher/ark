@@ -65,7 +65,7 @@ mod tests {
 
     fn parse_single_expr(code: &str) -> AnyRExpression {
         let parsed = aether_parser::parse(code, RParserOptions::default());
-        parsed.tree().expressions().iter().next().unwrap()
+        parsed.tree().statements().iter().next().unwrap().as_r_expression_statement().unwrap().expression().unwrap()
     }
 
     fn declare_arg_values(code: &str) -> Option<Vec<String>> {

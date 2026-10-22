@@ -4,12 +4,12 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use aether_path::FilePath;
-use oak_db::Db;
 use oak_db::DbInputs;
 use oak_db::OakDatabase;
 use oak_db::Package;
 use oak_db::Root;
 use oak_db::RootKind;
+use oak_db::SourceDb;
 use oak_package_metadata::namespace::Import;
 use oak_scan::DbScan;
 use oak_scan::RootExt;
@@ -61,6 +61,27 @@ fn test_scan_library_discovers_package() {
     assert_eq!(packages.len(), 1);
     assert_eq!(packages[0].name(&db), "dplyr");
     assert_eq!(packages[0].version(&db), &Some("1.0.0".to_string()),);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_scan_library_discovers_symlinked_package() {
+    // renv libraries link each package directory into a global cache
+    let cache = tempfile::tempdir().unwrap();
+    let lib = tempfile::tempdir().unwrap();
+    write_package(&cache.path().join("targets"), "targets", &[]);
+    std::os::unix::fs::symlink(cache.path().join("targets"), lib.path().join("targets")).unwrap();
+    let mut db = OakDatabase::new();
+
+    db.set_library_paths(&[lib.path().to_path_buf()]);
+
+    let packages = db.library_roots().roots(&db)[0].packages(&db).clone();
+    assert_eq!(packages.len(), 1);
+    assert_eq!(packages[0].name(&db), "targets");
+    assert_eq!(
+        packages[0].description_path(&db),
+        &FilePath::from_path_buf(lib.path().join("targets").join("DESCRIPTION")).unwrap()
+    );
 }
 
 #[test]
@@ -405,7 +426,14 @@ fn file_path(s: &str) -> FilePath {
 }
 
 fn empty_library_root(db: &OakDatabase, path: &str) -> Root {
-    Root::new(db, file_path(path), RootKind::Library, vec![], vec![])
+    Root::new(
+        db,
+        file_path(path),
+        RootKind::Library,
+        vec![],
+        vec![],
+        vec![],
+    )
 }
 
 /// Stash `pkg` in `root.packages` and register `root` on

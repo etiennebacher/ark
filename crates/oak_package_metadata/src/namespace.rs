@@ -32,7 +32,7 @@ impl Namespace {
     pub fn parse(contents: &str) -> anyhow::Result<Self> {
         let parsed = aether_parser::parse(contents, RParserOptions::default());
 
-        if let Some(err) = parsed.error() {
+        if let Some(err) = parsed.diagnostics().first() {
             return Err(anyhow::anyhow!("Failed to parse NAMESPACE file: {err:?}"));
         }
 
@@ -42,7 +42,7 @@ impl Namespace {
         let mut imports = Vec::new();
         let mut package_imports = Vec::new();
 
-        for expr in root.expressions().iter() {
+        for expr in root.statements().iter().filter_map(|s| s.as_r_expression_statement()?.expression().ok()) {
             let AnyRExpression::RCall(call) = expr else {
                 continue;
             };

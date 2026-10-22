@@ -13,6 +13,7 @@ use crate::lsp::config::LspConfig;
 use crate::lsp::config::LspSettings;
 use crate::lsp::open_file::OpenFile;
 use crate::lsp::traits::url::UrlExt;
+use crate::panic;
 
 #[derive(Default, Debug)]
 /// The world state, i.e. all the inputs necessary for analysing or refactoring
@@ -26,13 +27,20 @@ use crate::lsp::traits::url::UrlExt;
 /// else. This split mirrors rust-analyzer's `GlobalState` and
 /// `GlobalStateSnapshot`.
 pub(crate) struct WorldState {
-    /// Salsa input tree for Oak queries.
-    pub(crate) db: OakDatabase,
+    /// Oak query inputs. Private to ensure that query reads go through
+    /// [`Self::db()`] and input mutations through [`Self::db_mut()`].
+    db: OakDatabase,
 
     /// Watched documents, keyed on the normalised [`FilePath`] form.
     /// The verbatim editor `Uri` is preserved on each [`OpenFile::wire_uri`]
     /// for wire output.
     pub(crate) open_files: HashMap<FilePath, OpenFile>,
+
+    /// Open notebooks, keyed on the notebook's [`FilePath`]. Each value is the
+    /// notebook's cell paths as the client last described them, in the
+    /// client's order, so `didChange` splice indices apply directly. The cells
+    /// themselves are ordinary entries in `open_files`.
+    pub(crate) notebooks: HashMap<FilePath, Vec<FilePath>>,
 
     /// Watched folders
     pub(crate) workspace: Workspace,
@@ -72,6 +80,12 @@ pub(crate) struct WorldState {
     /// Persist `initializationOptions` so omitted settings in later pulls can
     /// fall through to it.
     pub(crate) initialization_options: LspSettings,
+
+    /// Captured once by [`Self::new()`]. These values override pulled client
+    /// settings and `initializationOptions` whenever [`Self::resolve_config()`]
+    /// runs, without rereading the environment. Tests can set or clear this
+    /// layer without changing the process environment.
+    pub(crate) env_settings: LspSettings,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -83,6 +97,7 @@ impl WorldState {
     pub(crate) fn new(db: OakDatabase) -> Self {
         let mut state = Self {
             db,
+            env_settings: env_settings(),
             ..Default::default()
         };
 
@@ -90,11 +105,43 @@ impl WorldState {
         state
     }
 
+    /// Ignore `OAK_SOURCE_FETCHING_ENABLED`, including on later settings pulls,
+    /// so client settings or the default control source fetching. Other
+    /// environment overrides still apply, and the process environment is unchanged.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn with_default_source_fetching(db: OakDatabase) -> Self {
+        let mut state = Self::new(db);
+        state.env_settings.source_fetching_enabled = None;
+        state.resolve_config(LspSettings::default());
+        state
+    }
+
+    /// Creates a test state without resolving `OAK_*` environment variables.
+    /// Tests can set configuration explicitly without inheriting the process environment.
+    #[cfg(test)]
+    pub(crate) fn with_db(db: OakDatabase) -> Self {
+        Self {
+            db,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn db(&self) -> &OakDatabase {
+        panic::assert_in_catch_boundary();
+        &self.db
+    }
+
+    pub(crate) fn db_mut(&mut self) -> &mut OakDatabase {
+        panic::assert_in_catch_boundary();
+        &mut self.db
+    }
+
     /// Resolve [`Self::config`] from environment, pulled client, and
     /// initialization options. Earlier layers override later ones, and missing
     /// values use defaults.
     pub(crate) fn resolve_config(&mut self, client_settings: LspSettings) {
-        env_settings()
+        self.env_settings
+            .clone()
             .or(client_settings)
             .or(self.initialization_options.clone())
             .resolve_into(&mut self.config);
@@ -107,7 +154,7 @@ impl WorldState {
     /// invalidates in-flight background workers (e.g. diagnostics), and
     /// triggers a diagnostic refresh.
     pub(crate) fn bump_revision(&mut self) {
-        self.db.synthetic_write(salsa::Durability::LOW);
+        self.db_mut().synthetic_write(salsa::Durability::LOW);
     }
 
     pub(crate) fn open_file_mut(&mut self, path: &FilePath) -> anyhow::Result<&mut OpenFile> {
@@ -133,7 +180,7 @@ impl WorldState {
     /// characters in a path (`[`, `]`, `|`, `^`) that `Uri` rejects, so
     /// [`aether_path::VirtualUri`]'s stored `Url` can be one `Uri` can't parse.
     pub(crate) fn wire_uri(&self, file: File) -> anyhow::Result<Uri> {
-        let path = file.path(&self.db);
+        let path = file.path(self.db());
 
         if let Some(open_file) = self.open_files.get(path) {
             return Ok(open_file.wire_uri().clone());

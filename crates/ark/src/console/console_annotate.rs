@@ -6,7 +6,7 @@
 
 use aether_path::FilePath;
 use aether_syntax::RBracedExpressions;
-use aether_syntax::RExpressionList;
+use aether_syntax::RStatementList;
 use aether_syntax::RLanguage;
 use aether_syntax::RSyntaxElement;
 use aether_syntax::RSyntaxKind;
@@ -566,7 +566,7 @@ impl SyntaxRewriter for AnnotationRewriter<'_> {
 
             let mut expr_info = Vec::new();
 
-            for expr in braced.expressions() {
+            for expr in braced.statements() {
                 let Some(start) = first_token_code_line(expr.syntax(), self.line_index) else {
                     self.err = Some(anyhow!("Failed to get start line for expression"));
                     return VisitNodeSignal::Traverse(node);
@@ -681,7 +681,7 @@ impl AnnotationRewriter<'_> {
         brace_code_line: u32,
         expr_info: Vec<ExprLineInfo>,
     ) -> RSyntaxNode {
-        let Some(list) = RExpressionList::cast(list_node.clone()) else {
+        let Some(list) = RStatementList::cast(list_node.clone()) else {
             return list_node;
         };
 
