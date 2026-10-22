@@ -5,9 +5,9 @@
 //
 
 use aether_path::FilePath;
-use aether_syntax::RBracedExpressions;
-use aether_syntax::RStatementList;
+use aether_syntax::RBracedStatements;
 use aether_syntax::RLanguage;
+use aether_syntax::RStatementList;
 use aether_syntax::RSyntaxElement;
 use aether_syntax::RSyntaxKind;
 use aether_syntax::RSyntaxNode;
@@ -183,9 +183,9 @@ pub(super) fn annotate_input(
     // directives are shifted by 1 line.
     let annotated_code = if let Some(breakpoints) = breakpoints {
         let parse = aether_parser::parse(code, Default::default());
-        if let Some(err) = parse.error() {
+        if parse.has_errors() {
             // Shouldn't happen since we're only operating on code that was parsed by R
-            return Err(anyhow!("Parse error in `annotate_input()`: {err}"));
+            return Err(anyhow!("Parse error in `annotate_input()`: {:?}", parse.diagnostics()));
         }
 
         let root = parse.tree();
@@ -337,9 +337,9 @@ fn annotate_braced_block(
     let line_index = LineIndex::new(&wrapped);
 
     let parse = aether_parser::parse(&wrapped, Default::default());
-    if let Some(err) = parse.error() {
+    if parse.has_errors() {
         // Shouldn't happen since we're only operating on code that was parsed by R
-        return Err(anyhow!("Parse error in `annotate_braced_block()`: {err}"));
+        return Err(anyhow!("Parse error in `annotate_braced_block()`: {:?}", parse.diagnostics()));
     }
 
     let root = parse.tree();
@@ -549,7 +549,7 @@ impl SyntaxRewriter for AnnotationRewriter<'_> {
         // lived in the source. We only rely on these cached source positions
         // when anchoring and invalidating breakpoints, tasks for which we need
         // the _original_ coordinates, not the new ones.
-        if let Some(braced) = RBracedExpressions::cast_ref(&node) {
+        if let Some(braced) = RBracedStatements::cast_ref(&node) {
             let Some(brace_code_line) = first_token_code_line(&node, self.line_index) else {
                 self.err = Some(anyhow!("Failed to get line for opening brace"));
                 return VisitNodeSignal::Traverse(node);
@@ -600,12 +600,12 @@ impl SyntaxRewriter for AnnotationRewriter<'_> {
         }
 
         // Only process expression lists
-        if node.kind() != RSyntaxKind::R_EXPRESSION_LIST {
+        if node.kind() != RSyntaxKind::R_STATEMENT_LIST {
             return node;
         }
 
         // Note we assume that only braced expressions and the root list have
-        // `R_EXPRESSION_LIST`, which is the case in our syntax
+        // `R_STATEMENT_LIST`, which is the case in our syntax
         if let Some(frame) = self.brace_stack.pop() {
             if frame.expr_info.is_empty() {
                 // Empty braces have no expressions to break on. Mark breakpoints
